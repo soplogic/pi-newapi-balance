@@ -24,7 +24,13 @@
 
 ## 安装
 
-要求已安装支持 Pi Package 的新版 Pi：
+要求已安装支持 Pi Package 的新版 Pi。推荐从 npm 安装：
+
+```bash
+pi install npm:pi-newapi-balance
+```
+
+也可以直接从 GitHub 安装开发仓库版本：
 
 ```bash
 pi install git:github.com/zxbdzh/pi-newapi-balance
@@ -36,17 +42,19 @@ pi install git:github.com/zxbdzh/pi-newapi-balance
 /reload
 ```
 
-更新插件：
+更新 npm 安装的插件：
 
 ```bash
-pi update --extensions
+pi update npm:pi-newapi-balance
 ```
 
-卸载插件：
+卸载 npm 安装的插件：
 
 ```bash
-pi remove git:github.com/zxbdzh/pi-newapi-balance
+pi remove npm:pi-newapi-balance
 ```
+
+使用 GitHub 安装时，将上述来源替换为 `git:github.com/zxbdzh/pi-newapi-balance`。
 
 ## 使用
 
@@ -56,7 +64,7 @@ pi remove git:github.com/zxbdzh/pi-newapi-balance
 /newapi-login
 ```
 
-按提示依次输入 Base URL、账号和密码。Base URL 可以是站点根地址，也可以是常见的 OpenAI API 地址：
+按持续显示的三步提示依次输入网站地址、账号和密码（密码只显示掩码）。Base URL 可以是站点根地址，也可以是常见的 OpenAI API 地址：
 
 ```text
 https://newapi.example.com

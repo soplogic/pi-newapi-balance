@@ -25,6 +25,11 @@ const FOLLOW_UP_DELAYS_MS = [1_000, 3_000, 6_000] as const;
 const DEDUCTION_ANIMATION_MS = 800;
 const DEDUCTION_DISPLAY_MS = 3_000;
 const DEDUCTION_FRAME_MS = 50;
+const LOGIN_PROMPT_TITLES = {
+	baseUrl: "New API 登录（1/3）：网站地址",
+	username: "New API 登录（2/3）：账号",
+	password: "New API 登录（3/3）：密码",
+} as const;
 const agentDir = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
 const configPath = join(agentDir, "newapi-balance.json");
 const legacyConfigPath = join(agentDir, "maolao-balance.json");
@@ -83,7 +88,7 @@ async function promptPassword(ctx: ExtensionContext): Promise<string | undefined
 		input.onEscape = () => done(undefined);
 		return {
 			render: (width) => {
-				const label = theme.fg("accent", "密码: ");
+				const label = theme.fg("accent", `${LOGIN_PROMPT_TITLES.password}  `);
 				const masked = "*".repeat(input.getValue().length);
 				return [truncateToWidth(label + masked, width)];
 			},
@@ -484,8 +489,8 @@ export default function (pi: ExtensionAPI) {
 			if (!sessionActive || !accountOperations.isCurrent(commandGeneration)) return;
 			const currentBaseUrl = config?.baseUrl;
 			const baseUrlInput = await ctx.ui.input(
-				"New API 登录",
-				currentBaseUrl ? `Base URL（留空沿用 ${currentBaseUrl}）` : "Base URL（例如 https://newapi.example.com）",
+				LOGIN_PROMPT_TITLES.baseUrl,
+				currentBaseUrl ? `留空沿用 ${currentBaseUrl}` : "例如 https://newapi.example.com",
 			);
 			if (!accountOperations.isCurrent(commandGeneration) || baseUrlInput === undefined) return;
 			if (!baseUrlInput.trim() && !currentBaseUrl) {
@@ -499,7 +504,7 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(errorMessage(error), "error");
 				return;
 			}
-			const username = await ctx.ui.input("New API 登录", "账号");
+			const username = await ctx.ui.input(LOGIN_PROMPT_TITLES.username);
 			if (!accountOperations.isCurrent(commandGeneration) || !username?.trim()) return;
 			const password = await promptPassword(ctx);
 			if (!accountOperations.isCurrent(commandGeneration) || password === undefined || password === "") return;

@@ -1,8 +1,17 @@
 {
   "name": "pi-newapi-balance",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Display a configurable New API account balance in the Pi terminal footer.",
   "type": "module",
+  "files": [
+    "index.ts",
+    "core.ts",
+    "lifecycle-operation-owner.ts",
+    "refresh-coordinator.ts",
+    "README.md",
+    "LICENSE",
+    "assets/*.png"
+  ],
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -21,8 +30,8 @@
   },
   "homepage": "https://github.com/zxbdzh/pi-newapi-balance#readme",
   "scripts": {
-    "test": "node --test core.test.ts lifecycle-operation-owner.test.ts refresh-coordinator.test.ts",
-    "check": "node --check index.ts && node --check core.ts && node --check lifecycle-operation-owner.ts && node --check refresh-coordinator.ts && node --check core.test.ts && node --check lifecycle-operation-owner.test.ts && node --check refresh-coordinator.test.ts"
+    "test": "node --test core.test.ts lifecycle-operation-owner.test.ts refresh-coordinator.test.ts login-prompts.test.ts",
+    "check": "node --check index.ts && node --check core.ts && node --check lifecycle-operation-owner.ts && node --check refresh-coordinator.ts && node --check core.test.ts && node --check lifecycle-operation-owner.test.ts && node --check refresh-coordinator.test.ts && node --check login-prompts.test.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
