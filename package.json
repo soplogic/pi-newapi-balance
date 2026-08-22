@@ -1,0 +1,38 @@
+{
+  "name": "pi-newapi-balance",
+  "version": "1.0.0",
+  "description": "Display a configurable New API account balance in the Pi terminal footer.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "new-api",
+    "terminal",
+    "balance"
+  ],
+  "license": "MIT",
+  "author": "zxbdzh",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zxbdzh/pi-newapi-balance.git"
+  },
+  "bugs": {
+    "url": "https://github.com/zxbdzh/pi-newapi-balance/issues"
+  },
+  "homepage": "https://github.com/zxbdzh/pi-newapi-balance#readme",
+  "scripts": {
+    "test": "node --test core.test.ts",
+    "check": "node --check index.ts && node --check core.ts && node --check core.test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "image": "https://raw.githubusercontent.com/zxbdzh/pi-newapi-balance/main/assets/pi-newapi-balance.png"
+  }
+}
