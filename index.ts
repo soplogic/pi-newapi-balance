@@ -7,12 +7,18 @@ import {
 	DEFAULT_REFRESH_INTERVAL_MS,
 	formatBalance,
 	loadConfig,
+	loadLegacyConfig,
 	NewApiClient,
 	type NewApiConfig,
 	normalizeBaseUrl,
 	removeConfig,
+	removeConfigTemporary,
 	saveConfig,
+	shouldPersistRefreshedConfig,
+	shouldRestorePeriodicRefresh,
 } from "./core.ts";
+import { LifecycleOperationOwner } from "./lifecycle-operation-owner.ts";
+import { RefreshCoordinator } from "./refresh-coordinator.ts";
 
 const STATUS_ID = "newapi-balance";
 const FOLLOW_UP_DELAYS_MS = [1_000, 3_000, 6_000] as const;
@@ -25,6 +31,19 @@ const legacyConfigPath = join(agentDir, "maolao-balance.json");
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+function fileErrorCode(error: unknown): string {
+	const code = (error as NodeJS.ErrnoException | undefined)?.code;
+	return typeof code === "string" && /^[A-Z0-9_]+$/.test(code) ? ` (${code})` : "";
+}
+
+function configReadError(error: unknown): string {
+	return `配置读取失败${fileErrorCode(error)}`;
+}
+
+function configWriteError(error: unknown): string {
+	return `配置保存失败${fileErrorCode(error)}`;
 }
 
 function formatTime(value: Date | undefined): string {
@@ -80,22 +99,21 @@ async function promptPassword(ctx: ExtensionContext): Promise<string | undefined
 export default function (pi: ExtensionAPI) {
 	const client = new NewApiClient();
 	let config: NewApiConfig | undefined;
-	let balance: number | undefined;
-	let lastUpdated: Date | undefined;
+	let balanceYuan: number | undefined;
+	let lastSuccessfulRefreshAt: Date | undefined;
 	let lastError: string | undefined;
-	let timer: ReturnType<typeof setTimeout> | undefined;
+	let periodicRefreshTimer: ReturnType<typeof setTimeout> | undefined;
 	let deductionAnimationTimer: ReturnType<typeof setInterval> | undefined;
 	let deductionClearTimer: ReturnType<typeof setTimeout> | undefined;
 	let deduction: { fromCents: number; toCents: number; amountCents: number; startedAt: number } | undefined;
-	let refreshInFlight: Promise<boolean> | undefined;
-	let refreshController: AbortController | undefined;
 	let followUpTimers: Array<ReturnType<typeof setTimeout>> = [];
-	let generation = 0;
-	let active = false;
+	let sessionActive = false;
 	let requestFooterRender: () => void = () => {};
+	const accountOperations = new LifecycleOperationOwner();
+	let refreshCoordinator: RefreshCoordinator;
 
 	function displayedBalance(): number | undefined {
-		if (!deduction) return balance;
+		if (!deduction) return balanceYuan;
 		const progress = Math.min(1, (Date.now() - deduction.startedAt) / DEDUCTION_ANIMATION_MS);
 		const cents = Math.round(deduction.fromCents + (deduction.toCents - deduction.fromCents) * progress);
 		return cents / 100;
@@ -133,7 +151,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function renderStatus(): void {
-		if (active) requestFooterRender();
+		if (sessionActive) requestFooterRender();
 	}
 
 	function installFooter(ctx: ExtensionContext): void {
@@ -141,7 +159,7 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.setStatus(STATUS_ID, undefined);
 		ctx.ui.setFooter((tui, theme, footerData) => {
 			requestFooterRender = () => {
-				if (active) tui.requestRender();
+				if (sessionActive) tui.requestRender();
 			};
 			const unsubscribe = footerData.onBranchChange(requestFooterRender);
 			return {
@@ -225,9 +243,9 @@ export default function (pi: ExtensionAPI) {
 		});
 	}
 
-	function clearTimer(): void {
-		if (timer) clearTimeout(timer);
-		timer = undefined;
+	function clearPeriodicRefresh(): void {
+		if (periodicRefreshTimer) clearTimeout(periodicRefreshTimer);
+		periodicRefreshTimer = undefined;
 	}
 
 	function clearDeduction(): void {
@@ -238,10 +256,18 @@ export default function (pi: ExtensionAPI) {
 		deduction = undefined;
 	}
 
-	function startDeduction(previousBalance: number, nextBalance: number): void {
+	function clearAccountState(error?: string): void {
+		config = undefined;
+		balanceYuan = undefined;
+		lastSuccessfulRefreshAt = undefined;
+		lastError = error;
 		clearDeduction();
-		const fromCents = Math.round(previousBalance * 100);
-		const toCents = Math.round(nextBalance * 100);
+	}
+
+	function startDeduction(previousBalanceYuan: number, nextBalanceYuan: number): void {
+		clearDeduction();
+		const fromCents = Math.round(previousBalanceYuan * 100);
+		const toCents = Math.round(nextBalanceYuan * 100);
 		if (toCents >= fromCents) return;
 		deduction = {
 			fromCents,
@@ -250,7 +276,7 @@ export default function (pi: ExtensionAPI) {
 			startedAt: Date.now(),
 		};
 		deductionAnimationTimer = setInterval(() => {
-			if (!active || !deduction) return;
+			if (!sessionActive || !deduction) return;
 			renderStatus();
 			if (Date.now() - deduction.startedAt >= DEDUCTION_ANIMATION_MS) {
 				clearInterval(deductionAnimationTimer);
@@ -263,37 +289,42 @@ export default function (pi: ExtensionAPI) {
 		}, DEDUCTION_DISPLAY_MS);
 	}
 
-	function applyBalance(nextBalance: number): boolean {
-		const previousBalance = balance;
-		balance = nextBalance;
-		if (previousBalance === undefined) return false;
-		const previousCents = Math.round(previousBalance * 100);
-		const nextCents = Math.round(nextBalance * 100);
+	function applyBalance(nextBalanceYuan: number): boolean {
+		const previousBalanceYuan = balanceYuan;
+		balanceYuan = nextBalanceYuan;
+		if (previousBalanceYuan === undefined) return false;
+		const previousCents = Math.round(previousBalanceYuan * 100);
+		const nextCents = Math.round(nextBalanceYuan * 100);
 		if (nextCents < previousCents) {
-			startDeduction(previousBalance, nextBalance);
+			startDeduction(previousBalanceYuan, nextBalanceYuan);
 			return true;
 		}
 		if (nextCents > previousCents) clearDeduction();
 		return false;
 	}
 
-	function clearFollowUps(): void {
+	function clearFollowUpTimers(): void {
 		for (const followUpTimer of followUpTimers) clearTimeout(followUpTimer);
 		followUpTimers = [];
 	}
 
-	function scheduleRefresh(): void {
-		clearTimer();
-		if (!active || !config) return;
-		const currentGeneration = generation;
-		timer = setTimeout(() => {
-			if (!active || currentGeneration !== generation) return;
+	function cancelSettledFollowUps(): void {
+		clearFollowUpTimers();
+		refreshCoordinator.cancelTrailing();
+	}
+
+	function schedulePeriodicRefresh(): void {
+		clearPeriodicRefresh();
+		if (!sessionActive || !config) return;
+		const scheduledGeneration = refreshCoordinator.currentGeneration();
+		periodicRefreshTimer = setTimeout(() => {
+			if (!refreshCoordinator.isCurrent(scheduledGeneration)) return;
 			void requestRefresh();
 		}, DEFAULT_REFRESH_INTERVAL_MS);
 	}
 
-	async function performRefresh(currentGeneration: number, signal: AbortSignal): Promise<boolean> {
-		if (!config || !active) {
+	async function performRefresh(refreshGeneration: number, signal: AbortSignal): Promise<boolean> {
+		if (!config || !refreshCoordinator.isCurrent(refreshGeneration)) {
 			renderStatus();
 			return false;
 		}
@@ -302,73 +333,129 @@ export default function (pi: ExtensionAPI) {
 		renderStatus();
 		try {
 			const refreshed = await client.refresh(currentConfig, signal);
-			if (!active || currentGeneration !== generation || signal.aborted) return false;
-			await saveConfig(configPath, refreshed.config);
-			if (!active || currentGeneration !== generation || signal.aborted) return false;
+			if (!refreshCoordinator.isCurrent(refreshGeneration) || signal.aborted) return false;
+			if (shouldPersistRefreshedConfig(currentConfig, refreshed.config)) {
+				try {
+					await saveConfig(configPath, refreshed.config);
+				} catch (error) {
+					if (refreshCoordinator.isCurrent(refreshGeneration) && !signal.aborted) lastError = configWriteError(error);
+					return false;
+				}
+			}
+			if (!refreshCoordinator.isCurrent(refreshGeneration) || signal.aborted) return false;
 			config = refreshed.config;
 			const decreased = applyBalance(refreshed.result.balance);
-			lastUpdated = new Date();
+			lastSuccessfulRefreshAt = new Date();
 			lastError = undefined;
 			return decreased;
 		} catch (error) {
-			if (!active || currentGeneration !== generation || signal.aborted) return false;
+			if (!refreshCoordinator.isCurrent(refreshGeneration) || signal.aborted) return false;
 			lastError = errorMessage(error);
 			return false;
 		} finally {
-			if (active && currentGeneration === generation && !signal.aborted) renderStatus();
+			if (refreshCoordinator.isCurrent(refreshGeneration) && !signal.aborted) renderStatus();
 		}
 	}
 
-	async function requestRefresh(): Promise<boolean> {
-		clearTimer();
-		if (!active) return false;
-		if (!refreshInFlight) {
-			const currentGeneration = generation;
-			refreshController = new AbortController();
-			refreshInFlight = performRefresh(currentGeneration, refreshController.signal).finally(() => {
-				refreshInFlight = undefined;
-				refreshController = undefined;
-			});
-		}
-		const decreased = await refreshInFlight;
-		if (active && config) scheduleRefresh();
-		return decreased;
+	refreshCoordinator = new RefreshCoordinator(performRefresh, clearFollowUpTimers);
+
+	async function requestRefresh(queueTrailingIfBusy = false): Promise<void> {
+		clearPeriodicRefresh();
+		const requestedGeneration = refreshCoordinator.currentGeneration();
+		await refreshCoordinator.request(queueTrailingIfBusy);
+		if (sessionActive && config && refreshCoordinator.isCurrent(requestedGeneration)) schedulePeriodicRefresh();
+	}
+
+	async function stopAsyncWork(): Promise<void> {
+		clearPeriodicRefresh();
+		cancelSettledFollowUps();
+		clearDeduction();
+		await Promise.all([accountOperations.deactivate(), refreshCoordinator.deactivate()]);
+		clearPeriodicRefresh();
+	}
+
+	async function restartRefreshLifecycle(): Promise<number> {
+		clearPeriodicRefresh();
+		cancelSettledFollowUps();
+		const generation = await refreshCoordinator.restart();
+		clearPeriodicRefresh();
+		return generation;
+	}
+
+	async function cleanTemporaryCredentials(): Promise<boolean> {
+		const results = await Promise.allSettled([
+			removeConfigTemporary(configPath),
+			removeConfigTemporary(legacyConfigPath),
+		]);
+		return results.every((result) => result.status === "fulfilled");
 	}
 
 	async function startSettledRefreshes(): Promise<void> {
-		clearFollowUps();
-		if (!config || !active) return;
-		const currentGeneration = generation;
+		cancelSettledFollowUps();
+		if (!config || !sessionActive) return;
+		const settledGeneration = refreshCoordinator.currentGeneration();
 		followUpTimers = FOLLOW_UP_DELAYS_MS.map((delay) =>
 			setTimeout(() => {
-				if (!active || currentGeneration !== generation) return;
-				void requestRefresh().then((decreased) => {
-					if (decreased) clearFollowUps();
-				});
+				if (!refreshCoordinator.isCurrent(settledGeneration)) return;
+				void requestRefresh(true);
 			}, delay),
 		);
-		if (await requestRefresh()) clearFollowUps();
+		await requestRefresh();
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
-		active = true;
+		sessionActive = true;
+		clearAccountState();
 		installFooter(ctx);
+		await stopAsyncWork();
+		if (!sessionActive) return;
+		const accountGeneration = await accountOperations.activate();
+		await refreshCoordinator.activate();
+		if (!sessionActive || !accountOperations.isCurrent(accountGeneration)) return;
+		let cleanupWarning = false;
+		type LoadedAccount = { config: NewApiConfig | undefined };
 		try {
-			config = await loadConfig(configPath);
-			if (!config) {
-				config = await loadConfig(legacyConfigPath);
-				if (config) await saveConfig(configPath, config);
-			}
-			lastError = undefined;
+			const loadedAccount = await accountOperations.run<LoadedAccount>(accountGeneration, async (signal) => {
+				if (!(await cleanTemporaryCredentials())) cleanupWarning = true;
+				if (signal.aborted || !accountOperations.isCurrent(accountGeneration)) return { config: undefined };
+				let candidate = await loadConfig(configPath);
+				if (signal.aborted || !accountOperations.isCurrent(accountGeneration)) return { config: undefined };
+				if (candidate) {
+					const legacyCleanup = await Promise.allSettled([
+						removeConfig(legacyConfigPath),
+					]);
+					if (legacyCleanup.some((result) => result.status === "rejected")) cleanupWarning = true;
+					return { config: candidate };
+				}
+				candidate = await loadLegacyConfig(legacyConfigPath);
+				if (signal.aborted || !accountOperations.isCurrent(accountGeneration) || !candidate) {
+					return { config: candidate };
+				}
+				await saveConfig(configPath, candidate);
+				if (signal.aborted || !accountOperations.isCurrent(accountGeneration)) return { config: undefined };
+				try {
+					await removeConfig(legacyConfigPath);
+				} catch {
+					cleanupWarning = true;
+				}
+				return { config: candidate };
+			});
+			if (!accountOperations.isCurrent(accountGeneration) || !loadedAccount) return;
+			config = loadedAccount.config;
+			lastError = cleanupWarning ? "配置已加载，但旧凭据清理失败" : undefined;
 		} catch (error) {
-			lastError = `配置读取失败: ${errorMessage(error)}`;
+			if (!accountOperations.isCurrent(accountGeneration)) return;
+			clearAccountState(configReadError(error));
 		}
 		renderStatus();
-		if (config) await requestRefresh();
+		if (config && accountOperations.isCurrent(accountGeneration)) await requestRefresh();
 	});
 
 	pi.on("before_agent_start", async () => {
-		clearFollowUps();
+		const refreshGeneration = await restartRefreshLifecycle();
+		if (shouldRestorePeriodicRefresh(config, sessionActive, refreshCoordinator.isCurrent(refreshGeneration))) {
+			schedulePeriodicRefresh();
+		}
 	});
 
 	pi.on("agent_settled", async () => {
@@ -376,15 +463,13 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
-		active = false;
-		generation++;
-		clearTimer();
-		clearFollowUps();
-		clearDeduction();
-		refreshController?.abort();
+		sessionActive = false;
 		requestFooterRender = () => {};
 		ctx.ui.setStatus(STATUS_ID, undefined);
 		if (ctx.mode === "tui") ctx.ui.setFooter(undefined);
+		clearAccountState();
+		await stopAsyncWork();
+		await cleanTemporaryCredentials();
 	});
 
 	pi.registerCommand("newapi-login", {
@@ -394,12 +479,15 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("当前模式不支持交互登录", "error");
 				return;
 			}
+			type LoginTransactionResult = { config: NewApiConfig } | { saveError: unknown };
+			const commandGeneration = await accountOperations.activate();
+			if (!sessionActive || !accountOperations.isCurrent(commandGeneration)) return;
 			const currentBaseUrl = config?.baseUrl;
 			const baseUrlInput = await ctx.ui.input(
 				"New API 登录",
 				currentBaseUrl ? `Base URL（留空沿用 ${currentBaseUrl}）` : "Base URL（例如 https://newapi.example.com）",
 			);
-			if (baseUrlInput === undefined) return;
+			if (!accountOperations.isCurrent(commandGeneration) || baseUrlInput === undefined) return;
 			if (!baseUrlInput.trim() && !currentBaseUrl) {
 				ctx.ui.notify("请输入 New API 站点的 Base URL", "warning");
 				return;
@@ -412,30 +500,59 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			const username = await ctx.ui.input("New API 登录", "账号");
-			if (!username?.trim()) return;
+			if (!accountOperations.isCurrent(commandGeneration) || !username?.trim()) return;
 			const password = await promptPassword(ctx);
-			if (password === undefined || password === "") return;
+			if (!accountOperations.isCurrent(commandGeneration) || password === undefined || password === "") return;
 			const candidate: NewApiConfig = { baseUrl, username: username.trim(), password };
+			clearPeriodicRefresh();
+			cancelSettledFollowUps();
+			clearDeduction();
+			await refreshCoordinator.deactivate();
+			clearPeriodicRefresh();
+			if (!sessionActive || !accountOperations.isCurrent(commandGeneration)) return;
+			const accountGeneration = commandGeneration;
+			await refreshCoordinator.activate();
+			if (!sessionActive || !accountOperations.isCurrent(accountGeneration)) return;
 			try {
-				generation++;
-				clearTimer();
-				clearFollowUps();
-				clearDeduction();
-				refreshController?.abort();
-				await refreshInFlight;
-				const loggedIn = await client.login(candidate);
-				await saveConfig(configPath, loggedIn);
-				config = loggedIn;
-				balance = undefined;
-				lastUpdated = undefined;
+				const loginResult = await accountOperations.run<LoginTransactionResult>(accountGeneration, async (signal) => {
+					const authenticated = await client.login(candidate, signal);
+					if (signal.aborted || !accountOperations.isCurrent(accountGeneration)) return { config: authenticated };
+					try {
+						await saveConfig(configPath, authenticated);
+					} catch (saveError) {
+						return { saveError };
+					}
+					return { config: authenticated };
+				});
+				if (!loginResult || !sessionActive || !accountOperations.isCurrent(accountGeneration)) return;
+				if ("saveError" in loginResult) {
+					const message = configWriteError(loginResult.saveError);
+					lastError = message;
+					renderStatus();
+					if (shouldRestorePeriodicRefresh(config, sessionActive, accountOperations.isCurrent(accountGeneration))) {
+						schedulePeriodicRefresh();
+					}
+					ctx.ui.notify(`登录失败: ${message}`, "error");
+					return;
+				}
+				config = loginResult.config;
+				balanceYuan = undefined;
+				lastSuccessfulRefreshAt = undefined;
 				lastError = undefined;
 				await requestRefresh();
-				ctx.ui.notify("登录成功，余额已更新", "info");
+				if (!accountOperations.isCurrent(accountGeneration)) return;
+				if (lastError || balanceYuan === undefined) {
+					ctx.ui.notify(`登录成功，但余额刷新失败${lastError ? `: ${lastError}` : ""}`, "warning");
+				} else {
+					ctx.ui.notify("登录成功，余额已更新", "info");
+				}
 			} catch (error) {
-				lastError = errorMessage(error);
+				if (!accountOperations.isCurrent(accountGeneration)) return;
+				const message = errorMessage(error);
+				lastError = message;
 				renderStatus();
-				if (config) scheduleRefresh();
-				ctx.ui.notify(`登录失败: ${lastError}`, "error");
+				if (config) schedulePeriodicRefresh();
+				ctx.ui.notify(`登录失败: ${message}`, "error");
 			}
 		},
 	});
@@ -447,29 +564,42 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("尚未登录，请先运行 /newapi-login", "warning");
 				return;
 			}
-			clearFollowUps();
+			const manualRefreshGeneration = await restartRefreshLifecycle();
+			if (!refreshCoordinator.isCurrent(manualRefreshGeneration) || !config) {
+				if (sessionActive) ctx.ui.notify("刷新已取消：当前未登录", "warning");
+				return;
+			}
 			await requestRefresh();
-			ctx.ui.notify(lastError ? `刷新失败: ${lastError}` : `当前余额 ${formatBalance(balance!)}`, lastError ? "error" : "info");
+			if (!refreshCoordinator.isCurrent(manualRefreshGeneration)) return;
+			ctx.ui.notify(
+				lastError || balanceYuan === undefined
+					? `刷新失败: ${lastError ?? "未返回有效余额"}`
+					: `当前余额 ${formatBalance(balanceYuan)}`,
+				lastError || balanceYuan === undefined ? "error" : "info",
+			);
 		},
 	});
 
 	pi.registerCommand("newapi-logout", {
 		description: "退出 New API 并清除本地凭据",
 		handler: async (_args, ctx) => {
-			generation++;
-			clearTimer();
-			clearFollowUps();
-			clearDeduction();
-			refreshController?.abort();
-			await refreshInFlight;
-			await removeConfig(configPath);
-			await removeConfig(legacyConfigPath);
-			config = undefined;
-			balance = undefined;
-			lastUpdated = undefined;
-			lastError = undefined;
+			await stopAsyncWork();
+			clearAccountState();
 			renderStatus();
-			ctx.ui.notify("已退出并清除本地凭据", "info");
+			if (!sessionActive) return;
+			const cleanupGeneration = await accountOperations.activate();
+			const cleanupResult = await accountOperations.run(cleanupGeneration, async () => {
+				const results = await Promise.allSettled([removeConfig(configPath), removeConfig(legacyConfigPath)]);
+				return results.every((result) => result.status === "fulfilled");
+			});
+			if (!sessionActive || !accountOperations.isCurrent(cleanupGeneration) || cleanupResult === undefined) return;
+			await refreshCoordinator.activate();
+			if (!accountOperations.isCurrent(cleanupGeneration)) return;
+			if (!cleanupResult) {
+				ctx.ui.notify("已退出，但部分本地凭据删除失败", "warning");
+			} else {
+				ctx.ui.notify("已退出并清除本地凭据", "info");
+			}
 		},
 	});
 
@@ -479,8 +609,8 @@ export default function (pi: ExtensionAPI) {
 			const lines = [
 				`站点: ${config?.baseUrl ?? "未配置"}`,
 				`状态: ${config ? (lastError ? "更新失败" : "已登录") : "未登录"}`,
-				`余额: ${balance === undefined ? "未知" : formatBalance(balance)}`,
-				`最近更新: ${formatTime(lastUpdated)}`,
+				`余额: ${balanceYuan === undefined ? "未知" : formatBalance(balanceYuan)}`,
+				`最近更新: ${formatTime(lastSuccessfulRefreshAt)}`,
 			];
 			if (lastError) lines.push(`错误: ${lastError}`);
 			ctx.ui.notify(lines.join("\n"), lastError ? "warning" : "info");

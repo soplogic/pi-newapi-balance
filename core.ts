@@ -5,6 +5,9 @@ export const LEGACY_DEFAULT_BASE_URL = "https://api.maolaoapi.cc";
 export const DEFAULT_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 export const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 export const QUOTA_PER_YUAN = 500_000;
+export const MAX_API_MESSAGE_LENGTH = 240;
+
+const CONTROL_CHARACTERS = /[\p{Cc}\p{Cf}]/gu;
 
 export interface NewApiConfig {
 	baseUrl: string;
@@ -67,12 +70,20 @@ export function normalizeBaseUrl(value: string): string {
 	return url.toString().replace(/\/$/, "");
 }
 
-export async function loadConfig(path: string): Promise<NewApiConfig | undefined> {
+type ConfigSource = "current" | "legacy";
+
+async function loadConfigFile(path: string, source: ConfigSource): Promise<NewApiConfig | undefined> {
 	try {
 		const value = JSON.parse(await readFile(path, "utf8")) as Partial<NewApiConfig>;
 		if (typeof value.username !== "string" || typeof value.password !== "string") return undefined;
+		const baseUrl = typeof value.baseUrl === "string"
+			? value.baseUrl
+			: source === "legacy"
+				? LEGACY_DEFAULT_BASE_URL
+				: undefined;
+		if (baseUrl === undefined) return undefined;
 		return {
-			baseUrl: normalizeBaseUrl(typeof value.baseUrl === "string" ? value.baseUrl : LEGACY_DEFAULT_BASE_URL),
+			baseUrl: normalizeBaseUrl(baseUrl),
 			username: value.username,
 			password: value.password,
 			session: typeof value.session === "string" ? value.session : undefined,
@@ -84,20 +95,104 @@ export async function loadConfig(path: string): Promise<NewApiConfig | undefined
 	}
 }
 
+/** Load the current config format, which always requires an explicit Base URL. */
+export function loadConfig(path: string): Promise<NewApiConfig | undefined> {
+	return loadConfigFile(path, "current");
+}
+
+/** Load the legacy config format for migration, supplying its historical site URL when absent. */
+export function loadLegacyConfig(path: string): Promise<NewApiConfig | undefined> {
+	return loadConfigFile(path, "legacy");
+}
+
+function canonicalizeSensitiveValue(value: string): string {
+	return value.replace(CONTROL_CHARACTERS, "");
+}
+
+function escapeRegularExpression(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function chooseRedactionMarker(sensitiveValues: readonly string[]): string {
+	const sensitiveCodePoints = new Set(sensitiveValues.flatMap((value) => Array.from(value)));
+	const candidates = ["[REDACTED]", "●", "■", "◆", "※"];
+	for (const candidate of candidates) {
+		if (Array.from(candidate).every((codePoint) => !sensitiveCodePoints.has(codePoint))) return candidate;
+	}
+	for (let codePoint = 0xe000; codePoint <= 0xf8ff; codePoint++) {
+		const candidate = String.fromCodePoint(codePoint);
+		if (!sensitiveCodePoints.has(candidate)) return candidate;
+	}
+	return "";
+}
+
+export function sanitizeApiMessage(
+	value: unknown,
+	fallback: string,
+	sensitiveValues: ReadonlyArray<string | undefined> = [],
+): string {
+	if (typeof value !== "string") return fallback;
+	const values = [...new Set(
+		sensitiveValues
+			.filter((item): item is string => typeof item === "string")
+			.map(canonicalizeSensitiveValue)
+			.filter((item) => item.length > 0),
+	)].sort((a, b) => Array.from(b).length - Array.from(a).length || a.localeCompare(b));
+	let sanitized = value;
+	if (values.length > 0) {
+		const controlsBetweenCodePoints = String.raw`[\p{Cc}\p{Cf}]*`;
+		const alternatives = values.map((sensitiveValue) =>
+			Array.from(sensitiveValue).map(escapeRegularExpression).join(controlsBetweenCodePoints),
+		);
+		const sensitivePattern = new RegExp(alternatives.join("|"), "gu");
+		const marker = chooseRedactionMarker(values);
+		sanitized = sanitized.replace(sensitivePattern, () => marker);
+	}
+	sanitized = sanitized.replace(CONTROL_CHARACTERS, " ").replace(/\s+/g, " ").trim();
+	if (!sanitized) return fallback;
+	const codePoints = Array.from(sanitized);
+	return codePoints.length > MAX_API_MESSAGE_LENGTH
+		? `${codePoints.slice(0, MAX_API_MESSAGE_LENGTH - 3).join("")}...`
+		: sanitized;
+}
+
+/** NewApiClient.refresh preserves config identity unless it reauthenticates. */
+export function shouldPersistRefreshedConfig(current: NewApiConfig, refreshed: NewApiConfig): boolean {
+	return current !== refreshed;
+}
+
+export function shouldRestorePeriodicRefresh(
+	currentConfig: NewApiConfig | undefined,
+	sessionActive: boolean,
+	operationIsCurrent: boolean,
+): boolean {
+	return currentConfig !== undefined && sessionActive && operationIsCurrent;
+}
+
 export async function saveConfig(path: string, config: NewApiConfig): Promise<void> {
 	await mkdir(dirname(path), { recursive: true });
 	const temporaryPath = `${path}.tmp`;
-	await writeFile(temporaryPath, `${JSON.stringify(config, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-	await rename(temporaryPath, path);
-	await chmod(path, 0o600).catch(() => undefined);
+	try {
+		await writeFile(temporaryPath, `${JSON.stringify(config, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+		await rename(temporaryPath, path);
+		await chmod(path, 0o600).catch(() => undefined);
+	} finally {
+		await rm(temporaryPath, { force: true }).catch(() => undefined);
+	}
+}
+
+export async function removeConfigTemporary(path: string): Promise<void> {
+	await rm(`${path}.tmp`, { force: true });
 }
 
 export async function removeConfig(path: string): Promise<void> {
-	await rm(path, { force: true });
+	const results = await Promise.allSettled([rm(path, { force: true }), removeConfigTemporary(path)]);
+	const rejected = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+	if (rejected) throw rejected.reason;
 }
 
-function apiMessage(value: ApiEnvelope<unknown>, fallback: string): string {
-	return value.message?.trim() || fallback;
+function apiMessage(value: ApiEnvelope<unknown>, fallback: string, config: NewApiConfig): string {
+	return sanitizeApiMessage(value.message, fallback, [config.username, config.password, config.session]);
 }
 
 function isAuthenticationFailure(response: Response, payload: ApiEnvelope<unknown>): boolean {
@@ -131,6 +226,7 @@ export class NewApiClient {
 
 	async login(config: NewApiConfig, signal?: AbortSignal): Promise<NewApiConfig> {
 		const baseUrl = normalizeBaseUrl(config.baseUrl);
+		const origin = new URL(baseUrl).origin;
 		const response = await withTimeout(signal, (requestSignal) =>
 			this.fetchImpl(`${baseUrl}/api/user/login?turnstile=`, {
 				method: "POST",
@@ -139,16 +235,17 @@ export class NewApiClient {
 					"cache-control": "no-store",
 					"content-type": "application/json",
 					"new-api-user": "-1",
-					origin: baseUrl,
+					origin,
 					referer: `${baseUrl}/login`,
 				},
 				body: JSON.stringify({ username: config.username, password: config.password }),
+				redirect: "error",
 				signal: requestSignal,
 			}),
 		);
 		const payload = (await response.json().catch(() => ({}))) as ApiEnvelope<LoginData>;
 		if (!response.ok || !payload.success || typeof payload.data?.id !== "number") {
-			throw new AuthenticationError(apiMessage(payload, `登录失败 (HTTP ${response.status})`));
+			throw new AuthenticationError(apiMessage(payload, `登录失败 (HTTP ${response.status})`, config));
 		}
 		const session = readSessionCookie(response);
 		if (!session) throw new AuthenticationError("登录成功，但响应中没有会话 Cookie");
@@ -167,12 +264,17 @@ export class NewApiClient {
 					"new-api-user": String(config.userId),
 					referer: `${baseUrl}/console`,
 				},
+				redirect: "error",
 				signal: requestSignal,
 			}),
 		);
 		const payload = (await response.json().catch(() => ({}))) as ApiEnvelope<SelfData>;
-		if (isAuthenticationFailure(response, payload)) throw new AuthenticationError(apiMessage(payload, "登录已失效"));
-		if (!response.ok || !payload.success) throw new Error(apiMessage(payload, `余额请求失败 (HTTP ${response.status})`));
+		if (isAuthenticationFailure(response, payload)) {
+			throw new AuthenticationError(apiMessage(payload, "登录已失效", config));
+		}
+		if (!response.ok || !payload.success) {
+			throw new Error(apiMessage(payload, `余额请求失败 (HTTP ${response.status})`, config));
+		}
 		if (typeof payload.data?.quota !== "number" || !Number.isFinite(payload.data.quota)) {
 			throw new Error("余额响应缺少有效 quota");
 		}

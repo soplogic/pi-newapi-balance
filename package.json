@@ -21,8 +21,8 @@
   },
   "homepage": "https://github.com/zxbdzh/pi-newapi-balance#readme",
   "scripts": {
-    "test": "node --test core.test.ts",
-    "check": "node --check index.ts && node --check core.ts && node --check core.test.ts"
+    "test": "node --test core.test.ts lifecycle-operation-owner.test.ts refresh-coordinator.test.ts",
+    "check": "node --check index.ts && node --check core.ts && node --check lifecycle-operation-owner.ts && node --check refresh-coordinator.ts && node --check core.test.ts && node --check lifecycle-operation-owner.test.ts && node --check refresh-coordinator.test.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

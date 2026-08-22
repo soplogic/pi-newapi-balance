@@ -2,6 +2,8 @@ node_modules/
 .pi/
 *.log
 newapi-balance.json
+newapi-balance.json.tmp
 maolao-balance.json
+maolao-balance.json.tmp
 .DS_Store
 Thumbs.db

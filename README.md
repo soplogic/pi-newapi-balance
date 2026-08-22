@@ -2,6 +2,8 @@
 
 在 [Pi](https://github.com/badlogic/pi-mono) 的终端底部持续显示 New API 账户余额，并在检测到结算扣款时播放余额滚动动画。
 
+以下截图来自隔离的本地 mock 服务，余额、账号状态和时间均为合成演示数据，不对应任何真实账户。
+
 ![Pi New API Balance 状态](assets/pi-newapi-balance.png)
 
 检测到扣款时，余额会滚动下降，并显示红色差额：
@@ -100,9 +102,11 @@ agent_settled  ── 立即 ── 1s ── 3s ── 6s
 ~/.pi/agent/newapi-balance.json
 ```
 
-设置 `PI_CODING_AGENT_DIR` 时，配置写入该目录。插件会尝试将文件权限限制为仅当前用户可读写，但账号、密码和 Session 仍以明文保存；请只在可信设备上使用，不要提交该配置文件。
+设置 `PI_CODING_AGENT_DIR` 时，配置写入该目录。插件会尝试将文件权限限制为仅当前用户可读写，并在保存失败或退出时清理已知的临时凭据文件；但账号、密码和 Session 仍以明文保存，请只在可信设备上使用，不要提交配置文件。
 
-旧版 `~/.pi/agent/maolao-balance.json` 会在首次加载时迁移到新配置文件，原站点地址仅用于迁移旧配置。`/newapi-logout` 会同时删除新旧配置。
+`http://` 与 `https://` 均受支持。远程 HTTP 连接不会提供传输加密，账号密码和 Session 可能被网络中的第三方截获；除本机开发或可信隔离网络外，建议使用 HTTPS。
+
+旧版 `~/.pi/agent/maolao-balance.json` 会在首次加载时迁移到新配置文件，并在新文件保存成功后删除。原站点地址仅用于迁移旧配置。`/newapi-logout` 会尝试删除新旧配置及其已知临时文件。
 
 ## 本地开发
 
