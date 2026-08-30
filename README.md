@@ -2,7 +2,7 @@
 
 在 [Pi](https://github.com/badlogic/pi-mono) 的终端底部持续显示 New API 账户余额，并在检测到结算扣款时播放余额滚动动画。
 
-> Live [New API](https://github.com/Calcium-Ion/new-api) account balance in the [Pi](https://github.com/badlogic/pi-mono) terminal footer, with a roll-down animation the moment a settlement deduction is detected. Works with any New API site; auto-refreshes every 5 minutes and right after each agent turn.
+[English](README.en.md)
 
 以下截图来自隔离的本地 mock 服务，余额、账号状态和时间均为合成演示数据，不对应任何真实账户。
 
