@@ -4,7 +4,7 @@
 
 [English](README.en.md)
 
-**在 Pi 终端页脚实时显示 New API 余额，扣款瞬间播放余额滚动动画。**
+**在 Pi 终端页脚实时显示 New API 订阅用量，用量增加瞬间播放滚动动画。**
 
 <sub>// 支持任意 New API 站点 · 无需面板 · 不打断 Agent</sub>
 
@@ -19,19 +19,19 @@
 
 ---
 
-> 以下截图来自隔离的本地 mock 服务，余额、账号状态和时间均为合成演示数据，不对应任何真实账户。
+> 以下截图来自隔离的本地 mock 服务，订阅用量、账号状态和时间均为合成演示数据，不对应任何真实账户。
 
 ## 截图
 
 <table>
   <tr>
     <td width="50%" align="center">
-      <img src="assets/pi-newapi-balance.png" alt="页脚余额状态" />
-      <sub><b>页脚状态</b> — 余额常驻页脚，不占用额外面板</sub>
+      <img src="assets/pi-newapi-balance.png" alt="页脚订阅状态" />
+      <sub><b>页脚状态</b> — 订阅用量常驻页脚，不占用额外面板</sub>
     </td>
     <td width="50%" align="center">
       <img src="assets/deduction-animation.png" alt="扣款动画" />
-      <sub><b>扣款动画</b> — 余额滚动下降 + 红色差额显示 3 秒</sub>
+      <sub><b>扣款动画</b> — 已用额度滚动上升 + 红色差额显示 3 秒</sub>
     </td>
   </tr>
 </table>
@@ -39,9 +39,9 @@
 ## 功能
 
 - ⚙️ **任意站点** — 支持用户配置任意 New API 站点的 Base URL（自动去除末尾 `/v1`）
-- 👀 **常驻页脚** — 余额与 24h 已用额度显示在 Pi 页脚，不占用额外面板
+- 👀 **常驻页脚** — 订阅用量（`订阅 ¥used/¥total`）与 24h 已用额度显示在 Pi 页脚，不占用额外面板
 - 🔄 **智能刷新** — 启动时 + 每 5 分钟自动刷新；每轮 Agent 完全结束后立即刷新，并在 1/3/6 秒补查异步结算
-- 🎬 **扣款动画** — 检测到余额下降立即取消剩余补查，约 800ms 滚动至新值，红色差额显示 3 秒
+- 🎬 **扣款动画** — 检测到已用额度增加立即取消剩余补查，约 800ms 滚动至新值，红色差额显示 3 秒
 - 🧹 **安全清理** — Session 切换、`/reload`、新对话、手动刷新和退出时清理后台任务
 - 🔑 **令牌认证** — 使用用户 ID + 系统访问令牌（Access Token）无状态认证，无需账号密码
 
@@ -78,8 +78,8 @@ pi install git:github.com/zxbdzh/pi-newapi-balance
 | 命令 | 作用 |
 | --- | --- |
 | `/newapi-login` | 登录或切换 New API 站点 |
-| `/newapi-refresh` | 立即刷新余额 |
-| `/newapi-status` | 查看站点、余额、24h 已用、更新时间及错误状态 |
+| `/newapi-refresh` | 立即刷新订阅用量 |
+| `/newapi-status` | 查看站点、订阅用量、24h 已用、更新时间及错误状态 |
 | `/newapi-logout` | 退出并清除本地凭据 |
 
 ## 刷新与扣款动画

@@ -15,9 +15,9 @@ export interface NewApiConfig {
 	accessToken: string;
 }
 
-export interface BalanceResult {
-	quota: number;
-	balance: number;
+export interface SubscriptionResult {
+	usedQuota: number;
+	totalQuota: number;
 }
 
 export interface RecentUsageResult {
@@ -32,8 +32,8 @@ interface ApiEnvelope<T> {
 	data?: T;
 }
 
-interface SelfData {
-	quota: number;
+interface SubscriptionSelfData {
+	all_subscriptions?: Array<{ subscription?: { amount_used?: number; amount_total?: number } }>;
 }
 
 interface UsageStatData {
@@ -200,38 +200,35 @@ export class NewApiClient {
 		this.fetchImpl = fetchImpl;
 	}
 
-	async getBalance(config: NewApiConfig, signal?: AbortSignal): Promise<BalanceResult> {
-		if (!config.userId || !config.accessToken) throw new AuthenticationError();
-		const baseUrl = normalizeBaseUrl(config.baseUrl);
+	async getSubscription(config: NewApiConfig, signal?: AbortSignal): Promise<SubscriptionResult> {
+		const baseUrl = this.requireBaseUrl(config);
 		const response = await withTimeout(signal, (requestSignal) =>
-			this.fetchImpl(`${baseUrl}/api/user/self`, {
-				headers: {
-					accept: "application/json, text/plain, */*",
-					"cache-control": "no-store",
-					authorization: `Bearer ${config.accessToken}`,
-					"new-api-user": config.userId,
-					referer: `${baseUrl}/console`,
-				},
+			this.fetchImpl(`${baseUrl}/api/subscription/self`, {
+				headers: buildAuthHeaders(baseUrl, config),
 				redirect: "error",
 				signal: requestSignal,
 			}),
 		);
-		const payload = (await response.json().catch(() => ({}))) as ApiEnvelope<SelfData>;
+		const payload = (await response.json().catch(() => ({}))) as ApiEnvelope<SubscriptionSelfData>;
 		if (isAuthenticationFailure(response, payload)) {
 			throw new AuthenticationError(apiMessage(payload, "访问令牌无效", config));
 		}
 		if (!response.ok || !payload.success) {
-			throw new Error(apiMessage(payload, `余额请求失败 (HTTP ${response.status})`, config));
+			throw new Error(apiMessage(payload, `订阅请求失败 (HTTP ${response.status})`, config));
 		}
-		if (typeof payload.data?.quota !== "number" || !Number.isFinite(payload.data.quota)) {
-			throw new Error("余额响应缺少有效 quota");
+		const allSubscriptions = Array.isArray(payload.data?.all_subscriptions) ? payload.data.all_subscriptions : [];
+		const subscription = allSubscriptions
+			.map((item) => item.subscription)
+			.find((sub): sub is { amount_used?: number; amount_total?: number } => Boolean(sub));
+		if (!subscription || typeof subscription.amount_total !== "number" || subscription.amount_total <= 0) {
+			throw new Error("订阅响应缺少有效配额");
 		}
-		return { quota: payload.data.quota, balance: quotaToBalance(payload.data.quota) };
+		const usedQuota = typeof subscription.amount_used === "number" && subscription.amount_used > 0 ? subscription.amount_used : 0;
+		return { usedQuota, totalQuota: subscription.amount_total };
 	}
 
 	async getRecentUsage(config: NewApiConfig, signal?: AbortSignal): Promise<RecentUsageResult> {
-		if (!config.userId || !config.accessToken) throw new AuthenticationError();
-		const baseUrl = normalizeBaseUrl(config.baseUrl);
+		const baseUrl = this.requireBaseUrl(config);
 		const endTimestamp = Math.floor(Date.now() / 1000);
 		const startTimestamp = endTimestamp - RECENT_USAGE_DAYS * 24 * 60 * 60;
 		const url = new URL(`${baseUrl}/api/log/self/stat`);
@@ -240,13 +237,7 @@ export class NewApiClient {
 		url.searchParams.set("default_time", String(RECENT_USAGE_DAYS));
 		const response = await withTimeout(signal, (requestSignal) =>
 			this.fetchImpl(url.toString(), {
-				headers: {
-					accept: "application/json, text/plain, */*",
-					"cache-control": "no-store",
-					authorization: `Bearer ${config.accessToken}`,
-					"new-api-user": config.userId,
-					referer: `${baseUrl}/console`,
-				},
+				headers: buildAuthHeaders(baseUrl, config),
 				redirect: "error",
 				signal: requestSignal,
 			}),
@@ -268,14 +259,29 @@ export class NewApiClient {
 	async refresh(
 		config: NewApiConfig,
 		signal?: AbortSignal,
-	): Promise<{ config: NewApiConfig; result: BalanceResult; usage?: RecentUsageResult }> {
-		const result = await this.getBalance(config, signal);
+	): Promise<{ config: NewApiConfig; subscription: SubscriptionResult; usage?: RecentUsageResult }> {
+		const subscription = await this.getSubscription(config, signal);
 		let usage: RecentUsageResult | undefined;
 		try {
 			usage = await this.getRecentUsage(config, signal);
 		} catch {
 			usage = undefined;
 		}
-		return { config, result, usage };
+		return { config, subscription, usage };
 	}
+
+	private requireBaseUrl(config: NewApiConfig): string {
+		if (!config.userId || !config.accessToken) throw new AuthenticationError();
+		return normalizeBaseUrl(config.baseUrl);
+	}
+}
+
+function buildAuthHeaders(baseUrl: string, config: NewApiConfig): Record<string, string> {
+	return {
+		accept: "application/json, text/plain, */*",
+		"cache-control": "no-store",
+		authorization: `Bearer ${config.accessToken}`,
+		"new-api-user": config.userId,
+		referer: `${baseUrl}/console`,
+	};
 }

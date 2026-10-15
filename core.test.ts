@@ -143,7 +143,7 @@ test("sanitizes and redacts server messages before exposing errors", async () =>
 	);
 	await assert.rejects(
 		() =>
-			balanceClient.getBalance({
+			balanceClient.getSubscription({
 				baseUrl: "https://example.test",
 				userId: "56",
 				accessToken: syntheticToken,
@@ -152,34 +152,66 @@ test("sanitizes and redacts server messages before exposing errors", async () =>
 	);
 });
 
-test("fetches balance with bearer access token and user id headers", async () => {
+test("fetches subscription with bearer access token and user id headers", async () => {
 	const requests: Array<{ url: string; init?: RequestInit }> = [];
 	const fakeFetch = async (url: string | URL | Request, init?: RequestInit) => {
 		requests.push({ url: String(url), init });
-		return new Response(JSON.stringify({ success: true, data: { quota: 77_930_416 } }), {
-			status: 200,
-			headers: { "content-type": "application/json" },
-		});
+		return new Response(
+			JSON.stringify({ success: true, data: { all_subscriptions: [{ subscription: { amount_used: 15_000_000, amount_total: 200_000_000 } }] } }),
+			{ status: 200, headers: { "content-type": "application/json" } },
+		);
 	};
 	const client = new NewApiClient(fakeFetch as typeof fetch);
-	const result = await client.getBalance({ baseUrl: "https://example.test/panel/v1/", userId: "56", accessToken: "tok" });
-	assert.equal(requests[0]!.url, "https://example.test/panel/api/user/self");
+	const result = await client.getSubscription({ baseUrl: "https://example.test/panel/v1/", userId: "56", accessToken: "tok" });
+	assert.equal(requests[0]!.url, "https://example.test/panel/api/subscription/self");
 	const headers = requests[0]!.init!.headers as Record<string, string>;
 	assert.equal(headers.authorization, "Bearer tok");
 	assert.equal(headers["new-api-user"], "56");
 	assert.equal(headers.cookie, undefined);
 	assert.equal(requests[0]!.init!.redirect, "error");
-	assert.equal(result.balance, 155.860832);
+	assert.deepEqual(result, { usedQuota: 15_000_000, totalQuota: 200_000_000 });
 });
 
-test("rejects balance requests when credentials are missing", async () => {
+test("picks the first subscription entry and rejects missing quota", async () => {
+	const withEntry = new NewApiClient(
+		(async () =>
+			new Response(
+				JSON.stringify({
+					success: true,
+					data: {
+						all_subscriptions: [
+							{},
+							{ subscription: { amount_used: 0, amount_total: 500_000 } },
+							{ subscription: { amount_used: 10, amount_total: 900_000 } },
+						],
+					},
+				}),
+				{ headers: { "content-type": "application/json" } },
+			)) as typeof fetch,
+	);
+	const result = await withEntry.getSubscription({ baseUrl: "https://example.test", userId: "56", accessToken: "tok" });
+	assert.deepEqual(result, { usedQuota: 0, totalQuota: 500_000 });
+
+	const emptyTotal = new NewApiClient(
+		(async () =>
+			new Response(JSON.stringify({ success: true, data: { all_subscriptions: [{ subscription: { amount_total: 0 } }] } }), {
+				headers: { "content-type": "application/json" },
+			})) as typeof fetch,
+	);
+	await assert.rejects(
+		() => emptyTotal.getSubscription({ baseUrl: "https://example.test", userId: "56", accessToken: "tok" }),
+		/订阅响应缺少有效配额/,
+	);
+});
+
+test("rejects subscription requests when credentials are missing", async () => {
 	const client = new NewApiClient(async () => new Response("{}", { status: 200 }));
 	await assert.rejects(
-		() => client.getBalance({ baseUrl: "https://example.test", userId: "", accessToken: "tok" }),
+		() => client.getSubscription({ baseUrl: "https://example.test", userId: "", accessToken: "tok" }),
 		AuthenticationError,
 	);
 	await assert.rejects(
-		() => client.getBalance({ baseUrl: "https://example.test", userId: "56", accessToken: "" }),
+		() => client.getSubscription({ baseUrl: "https://example.test", userId: "56", accessToken: "" }),
 		AuthenticationError,
 	);
 });
@@ -203,24 +235,25 @@ test("fetches recent usage with a trailing day window", async () => {
 	assert.deepEqual(usage, { quota: 519_873, requestCount: 12, tokenCount: 3400 });
 });
 
-test("refresh tolerates a failed usage request and still returns balance", async () => {
-	let selfCalls = 0;
+test("refresh tolerates a failed usage request and still returns subscription", async () => {
+	let subscriptionCalls = 0;
 	const fakeFetch = async (url: string | URL | Request) => {
 		if (String(url).includes("/log/self/stat")) {
 			return new Response(JSON.stringify({ success: false }), { status: 500 });
 		}
-		selfCalls++;
-		return new Response(JSON.stringify({ success: true, data: { quota: 500_000 } }), {
-			headers: { "content-type": "application/json" },
-		});
+		subscriptionCalls++;
+		return new Response(
+			JSON.stringify({ success: true, data: { all_subscriptions: [{ subscription: { amount_used: 500_000, amount_total: 1_000_000 } }] } }),
+			{ headers: { "content-type": "application/json" } },
+		);
 	};
 	const client = new NewApiClient(fakeFetch as typeof fetch);
 	const config: NewApiConfig = { baseUrl: "https://example.test", userId: "56", accessToken: "tok" };
 	const refreshed = await client.refresh(config);
 	assert.strictEqual(refreshed.config, config);
-	assert.equal(refreshed.result.balance, 1);
+	assert.deepEqual(refreshed.subscription, { usedQuota: 500_000, totalQuota: 1_000_000 });
 	assert.equal(refreshed.usage, undefined);
-	assert.equal(selfCalls, 1);
+	assert.equal(subscriptionCalls, 1);
 });
 
 test("refresh propagates authentication failures as AuthenticationError", async () => {

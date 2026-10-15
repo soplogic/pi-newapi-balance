@@ -102,7 +102,8 @@ async function promptSecret(ctx: ExtensionContext): Promise<string | undefined> 
 export default function (pi: ExtensionAPI) {
 	const client = new NewApiClient();
 	let config: NewApiConfig | undefined;
-	let balanceYuan: number | undefined;
+	let subscriptionUsedYuan: number | undefined;
+	let subscriptionTotalYuan: number | undefined;
 	let recentUsageYuan: number | undefined;
 	let lastSuccessfulRefreshAt: Date | undefined;
 	let lastError: string | undefined;
@@ -116,36 +117,37 @@ export default function (pi: ExtensionAPI) {
 	const accountOperations = new LifecycleOperationOwner();
 	let refreshCoordinator: RefreshCoordinator;
 
-	function displayedBalance(): number | undefined {
-		if (!deduction) return balanceYuan;
+	function displayedUsedYuan(): number | undefined {
+		if (!deduction) return subscriptionUsedYuan;
 		const progress = Math.min(1, (Date.now() - deduction.startedAt) / DEDUCTION_ANIMATION_MS);
 		const cents = Math.round(deduction.fromCents + (deduction.toCents - deduction.fromCents) * progress);
 		return cents / 100;
 	}
 
-	function balanceStatus(): {
+	function subscriptionStatus(): {
 		text: string;
 		color: "success" | "warning" | "error" | "dim";
 		deductionText?: string;
 		usageText?: string;
 	} {
-		const visibleBalance = displayedBalance();
+		const visibleUsed = displayedUsedYuan();
+		const visibleTotal = subscriptionTotalYuan;
 		let text: string;
 		let color: "success" | "warning" | "error" | "dim";
 		if (!config) {
-			text = "余额: 未登录";
+			text = "订阅: 未登录";
 			color = "dim";
-		} else if (visibleBalance !== undefined && lastError) {
-			text = `余额: ${formatBalance(visibleBalance)} (更新失败)`;
+		} else if (visibleUsed !== undefined && visibleTotal !== undefined && lastError) {
+			text = `订阅 ${formatBalance(visibleUsed)}/${formatBalance(visibleTotal)} (更新失败)`;
 			color = "warning";
-		} else if (visibleBalance !== undefined) {
-			text = `余额: ${formatBalance(visibleBalance)}`;
+		} else if (visibleUsed !== undefined && visibleTotal !== undefined) {
+			text = `订阅 ${formatBalance(visibleUsed)}/${formatBalance(visibleTotal)}`;
 			color = "success";
 		} else if (lastError) {
-			text = `余额: ${lastError}`;
+			text = `订阅: ${lastError}`;
 			color = "error";
 		} else {
-			text = "余额: 更新中...";
+			text = "订阅: 更新中...";
 			color = "dim";
 		}
 		return {
@@ -220,10 +222,10 @@ export default function (pi: ExtensionAPI) {
 								? theme.fg("warning", contextDisplay)
 								: contextDisplay,
 					);
-					const status = balanceStatus();
+					const status = subscriptionStatus();
 					parts.push(theme.fg(status.color, status.text));
 					if (status.deductionText) parts.push(theme.fg("error", status.deductionText.trimStart()));
-					if (status.usageText) parts.push(theme.fg("dim", status.usageText));
+					if (status.usageText) parts.push(theme.fg(status.color, status.usageText));
 					let left = parts.join(" ");
 					if (visibleWidth(left) > width) left = truncateToWidth(left, width, "...");
 
@@ -265,22 +267,23 @@ export default function (pi: ExtensionAPI) {
 
 	function clearAccountState(error?: string): void {
 		config = undefined;
-		balanceYuan = undefined;
+		subscriptionUsedYuan = undefined;
+		subscriptionTotalYuan = undefined;
 		recentUsageYuan = undefined;
 		lastSuccessfulRefreshAt = undefined;
 		lastError = error;
 		clearDeduction();
 	}
 
-	function startDeduction(previousBalanceYuan: number, nextBalanceYuan: number): void {
+	function startDeduction(previousUsedYuan: number, nextUsedYuan: number): void {
 		clearDeduction();
-		const fromCents = Math.round(previousBalanceYuan * 100);
-		const toCents = Math.round(nextBalanceYuan * 100);
-		if (toCents >= fromCents) return;
+		const fromCents = Math.round(previousUsedYuan * 100);
+		const toCents = Math.round(nextUsedYuan * 100);
+		if (toCents <= fromCents) return;
 		deduction = {
 			fromCents,
 			toCents,
-			amountCents: fromCents - toCents,
+			amountCents: toCents - fromCents,
 			startedAt: Date.now(),
 		};
 		deductionAnimationTimer = setInterval(() => {
@@ -297,17 +300,18 @@ export default function (pi: ExtensionAPI) {
 		}, DEDUCTION_DISPLAY_MS);
 	}
 
-	function applyBalance(nextBalanceYuan: number): boolean {
-		const previousBalanceYuan = balanceYuan;
-		balanceYuan = nextBalanceYuan;
-		if (previousBalanceYuan === undefined) return false;
-		const previousCents = Math.round(previousBalanceYuan * 100);
-		const nextCents = Math.round(nextBalanceYuan * 100);
-		if (nextCents < previousCents) {
-			startDeduction(previousBalanceYuan, nextBalanceYuan);
+	function applySubscriptionUsage(nextUsedYuan: number, nextTotalYuan: number): boolean {
+		const previousUsedYuan = subscriptionUsedYuan;
+		subscriptionUsedYuan = nextUsedYuan;
+		subscriptionTotalYuan = nextTotalYuan;
+		if (previousUsedYuan === undefined) return false;
+		const previousCents = Math.round(previousUsedYuan * 100);
+		const nextCents = Math.round(nextUsedYuan * 100);
+		if (nextCents > previousCents) {
+			startDeduction(previousUsedYuan, nextUsedYuan);
 			return true;
 		}
-		if (nextCents > previousCents) clearDeduction();
+		if (nextCents < previousCents) clearDeduction();
 		return false;
 	}
 
@@ -343,7 +347,10 @@ export default function (pi: ExtensionAPI) {
 			const refreshed = await client.refresh(currentConfig, signal);
 			if (!refreshCoordinator.isCurrent(refreshGeneration) || signal.aborted) return false;
 			config = refreshed.config;
-			const decreased = applyBalance(refreshed.result.balance);
+			const decreased = applySubscriptionUsage(
+				quotaToBalance(refreshed.subscription.usedQuota),
+				quotaToBalance(refreshed.subscription.totalQuota),
+			);
 			recentUsageYuan = refreshed.usage ? quotaToBalance(refreshed.usage.quota) : undefined;
 			lastSuccessfulRefreshAt = new Date();
 			lastError = undefined;
@@ -453,7 +460,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("newapi-login", {
-		description: "登录 New API 站点并开始显示余额",
+		description: "登录 New API 站点并开始显示订阅用量",
 		handler: async (_args, ctx) => {
 			if (!ctx.hasUI || ctx.mode !== "tui") {
 				ctx.ui.notify("当前模式不支持交互登录", "error");
@@ -495,7 +502,7 @@ export default function (pi: ExtensionAPI) {
 			if (!sessionActive || !accountOperations.isCurrent(accountGeneration)) return;
 			try {
 				const loginResult = await accountOperations.run<LoginTransactionResult>(accountGeneration, async (signal) => {
-					await client.getBalance(candidate, signal);
+					await client.getSubscription(candidate, signal);
 					if (signal.aborted || !accountOperations.isCurrent(accountGeneration)) return { config: candidate };
 					try {
 						await saveConfig(configPath, candidate);
@@ -516,16 +523,17 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				config = loginResult.config;
-				balanceYuan = undefined;
+				subscriptionUsedYuan = undefined;
+				subscriptionTotalYuan = undefined;
 				recentUsageYuan = undefined;
 				lastSuccessfulRefreshAt = undefined;
 				lastError = undefined;
 				await requestRefresh();
 				if (!accountOperations.isCurrent(accountGeneration)) return;
-				if (lastError || balanceYuan === undefined) {
-					ctx.ui.notify(`登录成功，但余额刷新失败${lastError ? `: ${lastError}` : ""}`, "warning");
+				if (lastError || subscriptionUsedYuan === undefined) {
+					ctx.ui.notify(`登录成功，但订阅刷新失败${lastError ? `: ${lastError}` : ""}`, "warning");
 				} else {
-					ctx.ui.notify("登录成功，余额已更新", "info");
+					ctx.ui.notify("登录成功，订阅用量已更新", "info");
 				}
 			} catch (error) {
 				if (!accountOperations.isCurrent(accountGeneration)) return;
@@ -539,7 +547,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("newapi-refresh", {
-		description: "立即刷新 New API 余额",
+		description: "立即刷新 New API 订阅用量",
 		handler: async (_args, ctx) => {
 			if (!config) {
 				ctx.ui.notify("尚未登录，请先运行 /newapi-login", "warning");
@@ -552,11 +560,15 @@ export default function (pi: ExtensionAPI) {
 			}
 			await requestRefresh();
 			if (!refreshCoordinator.isCurrent(manualRefreshGeneration)) return;
+			const subscriptionText =
+				subscriptionUsedYuan !== undefined && subscriptionTotalYuan !== undefined
+					? `订阅 ${formatBalance(subscriptionUsedYuan)}/${formatBalance(subscriptionTotalYuan)}`
+					: undefined;
 			ctx.ui.notify(
-				lastError || balanceYuan === undefined
-					? `刷新失败: ${lastError ?? "未返回有效余额"}`
-					: `当前余额 ${formatBalance(balanceYuan)}`,
-				lastError || balanceYuan === undefined ? "error" : "info",
+				lastError || !subscriptionText
+					? `刷新失败: ${lastError ?? "未返回有效订阅"}`
+					: subscriptionText,
+				lastError || !subscriptionText ? "error" : "info",
 			);
 		},
 	});
@@ -585,12 +597,16 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("newapi-status", {
-		description: "查看 New API 余额与刷新状态",
+		description: "查看 New API 订阅用量与刷新状态",
 		handler: async (_args, ctx) => {
+			const subscriptionText =
+				subscriptionUsedYuan !== undefined && subscriptionTotalYuan !== undefined
+					? `${formatBalance(subscriptionUsedYuan)}/${formatBalance(subscriptionTotalYuan)}`
+					: "未知";
 			const lines = [
 				`站点: ${config?.baseUrl ?? "未配置"}`,
 				`状态: ${config ? (lastError ? "更新失败" : "已登录") : "未登录"}`,
-				`余额: ${balanceYuan === undefined ? "未知" : formatBalance(balanceYuan)}`,
+				`订阅: ${subscriptionText}`,
 				`24h 已用: ${recentUsageYuan === undefined ? "未知" : formatBalance(recentUsageYuan)}`,
 				`最近更新: ${formatTime(lastSuccessfulRefreshAt)}`,
 			];
