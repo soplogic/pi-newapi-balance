@@ -7,14 +7,13 @@ import {
 	DEFAULT_REFRESH_INTERVAL_MS,
 	formatBalance,
 	loadConfig,
-	loadLegacyConfig,
 	NewApiClient,
 	type NewApiConfig,
 	normalizeBaseUrl,
+	quotaToBalance,
 	removeConfig,
 	removeConfigTemporary,
 	saveConfig,
-	shouldPersistRefreshedConfig,
 	shouldRestorePeriodicRefresh,
 } from "./core.ts";
 import { LifecycleOperationOwner } from "./lifecycle-operation-owner.ts";
@@ -27,12 +26,11 @@ const DEDUCTION_DISPLAY_MS = 3_000;
 const DEDUCTION_FRAME_MS = 50;
 const LOGIN_PROMPT_TITLES = {
 	baseUrl: "New API 登录（1/3）：网站地址",
-	username: "New API 登录（2/3）：账号",
-	password: "New API 登录（3/3）：密码",
+	userId: "New API 登录（2/3）：用户 ID",
+	accessToken: "New API 登录（3/3）：系统访问令牌",
 } as const;
 const agentDir = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
 const configPath = join(agentDir, "newapi-balance.json");
-const legacyConfigPath = join(agentDir, "maolao-balance.json");
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
@@ -79,7 +77,7 @@ function sanitizeStatus(text: string): string {
 	return text.replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim();
 }
 
-async function promptPassword(ctx: ExtensionContext): Promise<string | undefined> {
+async function promptSecret(ctx: ExtensionContext): Promise<string | undefined> {
 	if (ctx.mode !== "tui") return undefined;
 	return ctx.ui.custom<string | undefined>((tui, theme, _keybindings, done) => {
 		const input = new Input();
@@ -88,7 +86,7 @@ async function promptPassword(ctx: ExtensionContext): Promise<string | undefined
 		input.onEscape = () => done(undefined);
 		return {
 			render: (width) => {
-				const label = theme.fg("accent", `${LOGIN_PROMPT_TITLES.password}  `);
+				const label = theme.fg("accent", `${LOGIN_PROMPT_TITLES.accessToken}  `);
 				const masked = "*".repeat(input.getValue().length);
 				return [truncateToWidth(label + masked, width)];
 			},
@@ -105,6 +103,7 @@ export default function (pi: ExtensionAPI) {
 	const client = new NewApiClient();
 	let config: NewApiConfig | undefined;
 	let balanceYuan: number | undefined;
+	let recentUsageYuan: number | undefined;
 	let lastSuccessfulRefreshAt: Date | undefined;
 	let lastError: string | undefined;
 	let periodicRefreshTimer: ReturnType<typeof setTimeout> | undefined;
@@ -128,6 +127,7 @@ export default function (pi: ExtensionAPI) {
 		text: string;
 		color: "success" | "warning" | "error" | "dim";
 		deductionText?: string;
+		usageText?: string;
 	} {
 		const visibleBalance = displayedBalance();
 		let text: string;
@@ -152,6 +152,7 @@ export default function (pi: ExtensionAPI) {
 			text,
 			color,
 			deductionText: deduction ? `  -${formatBalance(deduction.amountCents / 100)}` : undefined,
+			usageText: config && recentUsageYuan !== undefined ? `24h 已用 ${formatBalance(recentUsageYuan)}` : undefined,
 		};
 	}
 
@@ -222,6 +223,7 @@ export default function (pi: ExtensionAPI) {
 					const status = balanceStatus();
 					parts.push(theme.fg(status.color, status.text));
 					if (status.deductionText) parts.push(theme.fg("error", status.deductionText.trimStart()));
+					if (status.usageText) parts.push(theme.fg("dim", status.usageText));
 					let left = parts.join(" ");
 					if (visibleWidth(left) > width) left = truncateToWidth(left, width, "...");
 
@@ -264,6 +266,7 @@ export default function (pi: ExtensionAPI) {
 	function clearAccountState(error?: string): void {
 		config = undefined;
 		balanceYuan = undefined;
+		recentUsageYuan = undefined;
 		lastSuccessfulRefreshAt = undefined;
 		lastError = error;
 		clearDeduction();
@@ -339,17 +342,9 @@ export default function (pi: ExtensionAPI) {
 		try {
 			const refreshed = await client.refresh(currentConfig, signal);
 			if (!refreshCoordinator.isCurrent(refreshGeneration) || signal.aborted) return false;
-			if (shouldPersistRefreshedConfig(currentConfig, refreshed.config)) {
-				try {
-					await saveConfig(configPath, refreshed.config);
-				} catch (error) {
-					if (refreshCoordinator.isCurrent(refreshGeneration) && !signal.aborted) lastError = configWriteError(error);
-					return false;
-				}
-			}
-			if (!refreshCoordinator.isCurrent(refreshGeneration) || signal.aborted) return false;
 			config = refreshed.config;
 			const decreased = applyBalance(refreshed.result.balance);
+			recentUsageYuan = refreshed.usage ? quotaToBalance(refreshed.usage.quota) : undefined;
 			lastSuccessfulRefreshAt = new Date();
 			lastError = undefined;
 			return decreased;
@@ -390,7 +385,6 @@ export default function (pi: ExtensionAPI) {
 	async function cleanTemporaryCredentials(): Promise<boolean> {
 		const results = await Promise.allSettled([
 			removeConfigTemporary(configPath),
-			removeConfigTemporary(legacyConfigPath),
 		]);
 		return results.every((result) => result.status === "fulfilled");
 	}
@@ -417,37 +411,18 @@ export default function (pi: ExtensionAPI) {
 		const accountGeneration = await accountOperations.activate();
 		await refreshCoordinator.activate();
 		if (!sessionActive || !accountOperations.isCurrent(accountGeneration)) return;
-		let cleanupWarning = false;
 		type LoadedAccount = { config: NewApiConfig | undefined };
 		try {
 			const loadedAccount = await accountOperations.run<LoadedAccount>(accountGeneration, async (signal) => {
-				if (!(await cleanTemporaryCredentials())) cleanupWarning = true;
+				if (!(await cleanTemporaryCredentials())) return { config: undefined };
 				if (signal.aborted || !accountOperations.isCurrent(accountGeneration)) return { config: undefined };
-				let candidate = await loadConfig(configPath);
+				const candidate = await loadConfig(configPath);
 				if (signal.aborted || !accountOperations.isCurrent(accountGeneration)) return { config: undefined };
-				if (candidate) {
-					const legacyCleanup = await Promise.allSettled([
-						removeConfig(legacyConfigPath),
-					]);
-					if (legacyCleanup.some((result) => result.status === "rejected")) cleanupWarning = true;
-					return { config: candidate };
-				}
-				candidate = await loadLegacyConfig(legacyConfigPath);
-				if (signal.aborted || !accountOperations.isCurrent(accountGeneration) || !candidate) {
-					return { config: candidate };
-				}
-				await saveConfig(configPath, candidate);
-				if (signal.aborted || !accountOperations.isCurrent(accountGeneration)) return { config: undefined };
-				try {
-					await removeConfig(legacyConfigPath);
-				} catch {
-					cleanupWarning = true;
-				}
 				return { config: candidate };
 			});
 			if (!accountOperations.isCurrent(accountGeneration) || !loadedAccount) return;
 			config = loadedAccount.config;
-			lastError = cleanupWarning ? "配置已加载，但旧凭据清理失败" : undefined;
+			lastError = undefined;
 		} catch (error) {
 			if (!accountOperations.isCurrent(accountGeneration)) return;
 			clearAccountState(configReadError(error));
@@ -504,11 +479,11 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(errorMessage(error), "error");
 				return;
 			}
-			const username = await ctx.ui.input(LOGIN_PROMPT_TITLES.username);
-			if (!accountOperations.isCurrent(commandGeneration) || !username?.trim()) return;
-			const password = await promptPassword(ctx);
-			if (!accountOperations.isCurrent(commandGeneration) || password === undefined || password === "") return;
-			const candidate: NewApiConfig = { baseUrl, username: username.trim(), password };
+			const userIdInput = await ctx.ui.input(LOGIN_PROMPT_TITLES.userId);
+			if (!accountOperations.isCurrent(commandGeneration) || !userIdInput?.trim()) return;
+			const accessToken = await promptSecret(ctx);
+			if (!accountOperations.isCurrent(commandGeneration) || accessToken === undefined || accessToken === "") return;
+			const candidate: NewApiConfig = { baseUrl, userId: userIdInput.trim(), accessToken };
 			clearPeriodicRefresh();
 			cancelSettledFollowUps();
 			clearDeduction();
@@ -520,14 +495,14 @@ export default function (pi: ExtensionAPI) {
 			if (!sessionActive || !accountOperations.isCurrent(accountGeneration)) return;
 			try {
 				const loginResult = await accountOperations.run<LoginTransactionResult>(accountGeneration, async (signal) => {
-					const authenticated = await client.login(candidate, signal);
-					if (signal.aborted || !accountOperations.isCurrent(accountGeneration)) return { config: authenticated };
+					await client.getBalance(candidate, signal);
+					if (signal.aborted || !accountOperations.isCurrent(accountGeneration)) return { config: candidate };
 					try {
-						await saveConfig(configPath, authenticated);
+						await saveConfig(configPath, candidate);
 					} catch (saveError) {
 						return { saveError };
 					}
-					return { config: authenticated };
+					return { config: candidate };
 				});
 				if (!loginResult || !sessionActive || !accountOperations.isCurrent(accountGeneration)) return;
 				if ("saveError" in loginResult) {
@@ -542,6 +517,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				config = loginResult.config;
 				balanceYuan = undefined;
+				recentUsageYuan = undefined;
 				lastSuccessfulRefreshAt = undefined;
 				lastError = undefined;
 				await requestRefresh();
@@ -594,7 +570,7 @@ export default function (pi: ExtensionAPI) {
 			if (!sessionActive) return;
 			const cleanupGeneration = await accountOperations.activate();
 			const cleanupResult = await accountOperations.run(cleanupGeneration, async () => {
-				const results = await Promise.allSettled([removeConfig(configPath), removeConfig(legacyConfigPath)]);
+				const results = await Promise.allSettled([removeConfig(configPath)]);
 				return results.every((result) => result.status === "fulfilled");
 			});
 			if (!sessionActive || !accountOperations.isCurrent(cleanupGeneration) || cleanupResult === undefined) return;
@@ -615,6 +591,7 @@ export default function (pi: ExtensionAPI) {
 				`站点: ${config?.baseUrl ?? "未配置"}`,
 				`状态: ${config ? (lastError ? "更新失败" : "已登录") : "未登录"}`,
 				`余额: ${balanceYuan === undefined ? "未知" : formatBalance(balanceYuan)}`,
+				`24h 已用: ${recentUsageYuan === undefined ? "未知" : formatBalance(recentUsageYuan)}`,
 				`最近更新: ${formatTime(lastSuccessfulRefreshAt)}`,
 			];
 			if (lastError) lines.push(`错误: ${lastError}`);

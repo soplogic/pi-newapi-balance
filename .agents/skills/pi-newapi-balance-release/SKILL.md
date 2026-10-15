@@ -14,7 +14,7 @@ By default, perform only read-only inspection, tests, syntax checks, `npm pack -
 
 Do not modify versions or files, stage, commit, tag, push, or run `npm publish` unless the user explicitly authorizes that specific action in the current conversation. A request for instructions, diagnosis, status, or loading this Skill is not authorization.
 
-Never request or expose an npm OTP, 2FA recovery code, granular access token, New API password, or Session cookie. The user must enter npm authentication secrets in their own interactive terminal. Do not place them in tool arguments, logs, files, scripts, Git history, or chat.
+Never request or expose an npm OTP, 2FA recovery code, granular access token, New API access token, or user ID. The user must enter npm authentication secrets in their own interactive terminal. Do not place them in tool arguments, logs, files, scripts, Git history, or chat.
 
 ## Resolve the repository first
 

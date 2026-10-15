@@ -5,19 +5,17 @@ import { join } from "node:path";
 import test from "node:test";
 import {
 	AuthenticationError,
-	LEGACY_DEFAULT_BASE_URL,
 	MAX_API_MESSAGE_LENGTH,
 	formatBalance,
 	loadConfig,
-	loadLegacyConfig,
 	NewApiClient,
+	type NewApiConfig,
 	normalizeBaseUrl,
 	quotaToBalance,
 	removeConfig,
 	removeConfigTemporary,
 	sanitizeApiMessage,
 	saveConfig,
-	shouldPersistRefreshedConfig,
 	shouldRestorePeriodicRefresh,
 } from "./core.ts";
 
@@ -37,10 +35,10 @@ test("normalizes New API base URLs", () => {
 test("persists credentials with restrictive permissions and removes temporary artifacts", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "newapi-"));
 	const path = join(directory, "config.json");
-	const config = { baseUrl: "https://example.test", username: "user", password: "plain", session: "cookie", userId: 42 };
+	const config = { baseUrl: "https://example.test", userId: "56", accessToken: "secret-token" };
 	await saveConfig(path, config);
 	assert.deepEqual(await loadConfig(path), config);
-	assert.match(await readFile(path, "utf8"), /"password": "plain"/);
+	assert.match(await readFile(path, "utf8"), /"accessToken": "secret-token"/);
 	if (process.platform !== "win32") assert.equal((await stat(path)).mode & 0o777, 0o600);
 	await writeFile(`${path}.tmp`, "synthetic temporary data", { mode: 0o600 });
 	await removeConfig(path);
@@ -53,7 +51,7 @@ test("cleans the temporary credential file when an atomic rename fails", async (
 	const path = join(directory, "config.json");
 	await mkdir(path);
 	await assert.rejects(() =>
-		saveConfig(path, { baseUrl: "https://example.test", username: "user", password: "synthetic" }),
+		saveConfig(path, { baseUrl: "https://example.test", userId: "56", accessToken: "synthetic" }),
 	);
 	await assert.rejects(() => stat(`${path}.tmp`), { code: "ENOENT" });
 });
@@ -68,35 +66,18 @@ test("removes only a stale temporary credential artifact", async () => {
 	await assert.rejects(() => stat(`${path}.tmp`), { code: "ENOENT" });
 });
 
-test("requires an explicit valid Base URL in current configs", async () => {
+test("requires a userId, access token, and valid Base URL in current configs", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "newapi-current-config-"));
 	const path = join(directory, "config.json");
-	await writeFile(path, JSON.stringify({ username: "current-user", password: "synthetic-current-password" }), "utf8");
+	await writeFile(path, JSON.stringify({ userId: "56", accessToken: "synthetic-current-token" }), "utf8");
 	assert.equal(await loadConfig(path), undefined);
 
 	await writeFile(
 		path,
-		JSON.stringify({ baseUrl: "not-a-url", username: "current-user", password: "synthetic-current-password" }),
+		JSON.stringify({ baseUrl: "not-a-url", userId: "56", accessToken: "synthetic-current-token" }),
 		"utf8",
 	);
 	await assert.rejects(() => loadConfig(path), /Base URL/);
-});
-
-test("loads and persists a resolved Base URL only through legacy migration", async () => {
-	const directory = await mkdtemp(join(tmpdir(), "newapi-legacy-"));
-	const legacyPath = join(directory, "maolao-balance.json");
-	const currentPath = join(directory, "newapi-balance.json");
-	await writeFile(
-		legacyPath,
-		JSON.stringify({ username: "legacy-user", password: "synthetic-legacy-password" }),
-		"utf8",
-	);
-	const legacyConfig = await loadLegacyConfig(legacyPath);
-	assert.equal(legacyConfig?.baseUrl, LEGACY_DEFAULT_BASE_URL);
-	assert.ok(legacyConfig);
-	await saveConfig(currentPath, legacyConfig);
-	assert.equal(JSON.parse(await readFile(currentPath, "utf8")).baseUrl, LEGACY_DEFAULT_BASE_URL);
-	assert.deepEqual(await loadConfig(currentPath), legacyConfig);
 });
 
 function canonicalizeForAssertion(value: string): string {
@@ -112,19 +93,19 @@ function assertContainsNoCanonicalSensitiveValue(output: string, sensitiveValues
 }
 
 test("sanitizes and redacts server messages before exposing errors", async () => {
-	const syntheticPassword = "synthetic-password";
-	const formattedPassword = "synthetic\u200bsecret";
-	const syntheticSession = "synthetic-session";
-	const malicious = `  failed\u001b]52;c;clipboard\u0007\r\n\u0085\u202e\u2066\u200b\ufeff ${syntheticPassword} ${formattedPassword} ${syntheticSession} ${"😀".repeat(300)}  `;
-	const sanitized = sanitizeApiMessage(malicious, "fallback", [syntheticPassword, formattedPassword, syntheticSession]);
+	const syntheticToken = "synthetic-token";
+	const formattedToken = "synthetic​secret";
+	const syntheticUserId = "synthetic-user-id";
+	const malicious = `  failed\u001b]52;c;clipboard\u0007\r\n\u0085‮⁦​﻿ ${syntheticToken} ${formattedToken} ${syntheticUserId} ${"😀".repeat(300)}  `;
+	const sanitized = sanitizeApiMessage(malicious, "fallback", [syntheticToken, formattedToken, syntheticUserId]);
 	assert.equal(/[\p{Cc}\p{Cf}]/u.test(sanitized), false);
 	assert.equal(sanitized.includes("  "), false);
-	assert.equal(sanitized.includes(syntheticPassword), false);
+	assert.equal(sanitized.includes(syntheticToken), false);
 	assert.equal(sanitized.includes("synthetic secret"), false);
-	assert.equal(sanitized.includes(syntheticSession), false);
+	assert.equal(sanitized.includes(syntheticUserId), false);
 	assert.equal(Array.from(sanitized).length, MAX_API_MESSAGE_LENGTH);
 	assert.match(sanitized, /\.\.\.$/);
-	assert.equal(sanitizeApiMessage("\u001b\u200b\u0007", "fallback", ["fallback"]), "fallback");
+	assert.equal(sanitizeApiMessage("\u001b​\u0007", "fallback", ["fallback"]), "fallback");
 	assert.equal(sanitizeApiMessage(undefined, "login failed", ["i"]), "login failed");
 
 	const canonicalSensitiveValues = [
@@ -134,16 +115,16 @@ test("sanitizes and redacts server messages before exposing errors", async () =>
 		"[REDACTED]",
 		"x",
 		"🔐safe",
-		"control\u200bsecret",
+		"control​secret",
 	];
 	const adversarialMessage = [
 		"denied",
-		"a\u200bb\u202ec\u00001\u20662\u00073",
+		"a​b‮c\u00001⁦2\u00073",
 		"abc123 abc bc1",
 		"[REDACTED]",
 		"x",
-		"🔐\u200bs\u202ea\u0000f\u2066e",
-		"control\u0007s\u200be\u202ec\u2066r\u0000e\u2069t",
+		"🔐​s‮a\u0000f⁦e",
+		"control\u0007s​e‮c⁦r\u0000e⁩t",
 		"still useful",
 	].join(" | ");
 	const adversarialSanitized = sanitizeApiMessage(adversarialMessage, "fallback", canonicalSensitiveValues);
@@ -153,18 +134,9 @@ test("sanitizes and redacts server messages before exposing errors", async () =>
 	assert.equal(adversarialSanitized.includes("[REDACTED]"), false);
 	assertContainsNoCanonicalSensitiveValue(adversarialSanitized, canonicalSensitiveValues);
 
-	const loginClient = new NewApiClient(
-		(async () =>
-			new Response(JSON.stringify({ success: false, message: `echo ${syntheticPassword}` }), { status: 401 })) as typeof fetch,
-	);
-	await assert.rejects(
-		() => loginClient.login({ baseUrl: "https://example.test", username: "u", password: syntheticPassword }),
-		(error: unknown) => error instanceof AuthenticationError && error.message === "echo [REDACTED]",
-	);
-
 	const balanceClient = new NewApiClient(
 		(async () =>
-			new Response(JSON.stringify({ success: false, message: `expired ${syntheticSession}` }), {
+			new Response(JSON.stringify({ success: false, message: `expired ${syntheticToken}` }), {
 				status: 500,
 				headers: { "content-type": "application/json" },
 			})) as typeof fetch,
@@ -173,151 +145,102 @@ test("sanitizes and redacts server messages before exposing errors", async () =>
 		() =>
 			balanceClient.getBalance({
 				baseUrl: "https://example.test",
-				username: "u",
-				password: syntheticPassword,
-				session: syntheticSession,
-				userId: 7,
+				userId: "56",
+				accessToken: syntheticToken,
 			}),
 		(error: unknown) => error instanceof Error && error.message === "expired [REDACTED]",
 	);
 });
 
-test("logs in, captures session cookie, and fetches balance", async () => {
+test("fetches balance with bearer access token and user id headers", async () => {
 	const requests: Array<{ url: string; init?: RequestInit }> = [];
 	const fakeFetch = async (url: string | URL | Request, init?: RequestInit) => {
 		requests.push({ url: String(url), init });
-		if (String(url).includes("/login")) {
-			return new Response(JSON.stringify({ success: true, data: { id: 5590 } }), {
-				status: 200,
-				headers: { "content-type": "application/json", "set-cookie": "session=abc123; Path=/; HttpOnly" },
-			});
-		}
 		return new Response(JSON.stringify({ success: true, data: { quota: 77_930_416 } }), {
 			status: 200,
 			headers: { "content-type": "application/json" },
 		});
 	};
 	const client = new NewApiClient(fakeFetch as typeof fetch);
-	const config = await client.login({ baseUrl: "https://example.test/panel/v1/", username: "u", password: "p" });
-	assert.deepEqual(config, {
-		baseUrl: "https://example.test/panel",
-		username: "u",
-		password: "p",
-		session: "abc123",
-		userId: 5590,
-	});
-	const result = await client.getBalance(config);
-	assert.equal(requests[0]!.url, "https://example.test/panel/api/user/login?turnstile=");
-	assert.equal(requests[1]!.url, "https://example.test/panel/api/user/self");
-	assert.equal((requests[0]!.init!.headers as Record<string, string>).origin, "https://example.test");
-	assert.equal((requests[0]!.init!.headers as Record<string, string>).referer, "https://example.test/panel/login");
+	const result = await client.getBalance({ baseUrl: "https://example.test/panel/v1/", userId: "56", accessToken: "tok" });
+	assert.equal(requests[0]!.url, "https://example.test/panel/api/user/self");
+	const headers = requests[0]!.init!.headers as Record<string, string>;
+	assert.equal(headers.authorization, "Bearer tok");
+	assert.equal(headers["new-api-user"], "56");
+	assert.equal(headers.cookie, undefined);
 	assert.equal(requests[0]!.init!.redirect, "error");
-	assert.equal(requests[1]!.init!.redirect, "error");
 	assert.equal(result.balance, 155.860832);
-	assert.equal((requests[1]!.init!.headers as Record<string, string>).cookie, "session=abc123");
-	assert.equal((requests[1]!.init!.headers as Record<string, string>)["new-api-user"], "5590");
 });
 
-test("refresh config persistence follows the reauthentication identity contract", async () => {
-	const currentConfig: NewApiConfig = {
-		baseUrl: "https://example.test",
-		username: "user",
-		password: "synthetic-password",
-		session: "current-session",
-		userId: 7,
-	};
-	const directClient = new NewApiClient(
-		(async () =>
-			new Response(JSON.stringify({ success: true, data: { quota: 500_000 } }), {
-				headers: { "content-type": "application/json" },
-			})) as typeof fetch,
+test("rejects balance requests when credentials are missing", async () => {
+	const client = new NewApiClient(async () => new Response("{}", { status: 200 }));
+	await assert.rejects(
+		() => client.getBalance({ baseUrl: "https://example.test", userId: "", accessToken: "tok" }),
+		AuthenticationError,
 	);
-	const unchanged = await directClient.refresh(currentConfig);
-	assert.strictEqual(unchanged.config, currentConfig);
-	assert.equal(shouldPersistRefreshedConfig(currentConfig, unchanged.config), false);
-
-	const reauthenticatedConfig = { ...currentConfig, session: "new-session" };
-	assert.equal(shouldPersistRefreshedConfig(currentConfig, reauthenticatedConfig), true);
+	await assert.rejects(
+		() => client.getBalance({ baseUrl: "https://example.test", userId: "56", accessToken: "" }),
+		AuthenticationError,
+	);
 });
 
-test("restores periodic refresh only for the retained current account", () => {
-	const config: NewApiConfig = {
-		baseUrl: "https://example.test",
-		username: "user",
-		password: "synthetic-password",
+test("fetches recent usage with a trailing day window", async () => {
+	const requests: Array<{ url: string; init?: RequestInit }> = [];
+	const fakeFetch = async (url: string | URL | Request, init?: RequestInit) => {
+		requests.push({ url: String(url), init });
+		return new Response(JSON.stringify({ success: true, data: { quota: 519_873, rpm: 12, tpm: 3400 } }), {
+			status: 200,
+			headers: { "content-type": "application/json" },
+		});
 	};
-	assert.equal(shouldRestorePeriodicRefresh(config, true, true), true);
-	assert.equal(shouldRestorePeriodicRefresh(undefined, true, true), false);
-	assert.equal(shouldRestorePeriodicRefresh(config, false, true), false);
-	assert.equal(shouldRestorePeriodicRefresh(config, true, false), false);
+	const client = new NewApiClient(fakeFetch as typeof fetch);
+	const usage = await client.getRecentUsage({ baseUrl: "https://example.test", userId: "56", accessToken: "tok" });
+	const url = new URL(requests[0]!.url);
+	assert.equal(url.origin + url.pathname, "https://example.test/api/log/self/stat");
+	assert.equal(url.searchParams.get("default_time"), "1");
+	assert.ok(Number(url.searchParams.get("start_timestamp")) > 0);
+	assert.ok(Number(url.searchParams.get("end_timestamp")) > Number(url.searchParams.get("start_timestamp")));
+	assert.deepEqual(usage, { quota: 519_873, requestCount: 12, tokenCount: 3400 });
 });
 
-test("refresh logs in once when the existing session is unauthorized", async () => {
+test("refresh tolerates a failed usage request and still returns balance", async () => {
 	let selfCalls = 0;
 	const fakeFetch = async (url: string | URL | Request) => {
-		if (String(url).includes("/login")) {
-			return new Response(JSON.stringify({ success: true, data: { id: 7 } }), {
-				headers: { "content-type": "application/json", "set-cookie": "session=new-session; Path=/" },
-			});
+		if (String(url).includes("/log/self/stat")) {
+			return new Response(JSON.stringify({ success: false }), { status: 500 });
 		}
 		selfCalls++;
-		if (selfCalls === 1) return new Response(JSON.stringify({ success: false }), { status: 401 });
 		return new Response(JSON.stringify({ success: true, data: { quota: 500_000 } }), {
 			headers: { "content-type": "application/json" },
 		});
 	};
 	const client = new NewApiClient(fakeFetch as typeof fetch);
-	const originalConfig: NewApiConfig = {
-		baseUrl: "https://example.test",
-		username: "u",
-		password: "p",
-		session: "old",
-		userId: 7,
-	};
-	const refreshed = await client.refresh(originalConfig);
-	assert.equal(refreshed.config.session, "new-session");
-	assert.notStrictEqual(refreshed.config, originalConfig);
-	assert.equal(shouldPersistRefreshedConfig(originalConfig, refreshed.config), true);
+	const config: NewApiConfig = { baseUrl: "https://example.test", userId: "56", accessToken: "tok" };
+	const refreshed = await client.refresh(config);
+	assert.strictEqual(refreshed.config, config);
 	assert.equal(refreshed.result.balance, 1);
-	assert.equal(selfCalls, 2);
+	assert.equal(refreshed.usage, undefined);
+	assert.equal(selfCalls, 1);
 });
 
-test("refresh also reauthenticates for HTTP 200 login-expired envelopes", async () => {
-	let selfCalls = 0;
-	const fakeFetch = async (url: string | URL | Request) => {
-		if (String(url).includes("/login")) {
-			return new Response(JSON.stringify({ success: true, data: { id: 7 } }), {
-				headers: { "content-type": "application/json", "set-cookie": "session=fresh; Path=/" },
-			});
-		}
-		selfCalls++;
-		if (selfCalls === 1) {
-			return new Response(JSON.stringify({ success: false, message: "未登录或登录已过期" }), {
-				headers: { "content-type": "application/json" },
-			});
-		}
-		return new Response(JSON.stringify({ success: true, data: { quota: 1_000_000 } }), {
-			headers: { "content-type": "application/json" },
-		});
-	};
-	const client = new NewApiClient(fakeFetch as typeof fetch);
-	const refreshed = await client.refresh({
-		baseUrl: "https://example.test",
-		username: "u",
-		password: "p",
-		session: "old",
-		userId: 7,
-	});
-	assert.equal(refreshed.config.session, "fresh");
-	assert.equal(refreshed.result.balance, 2);
-});
-
-test("rejects unsuccessful login without exposing the password", async () => {
+test("refresh propagates authentication failures as AuthenticationError", async () => {
 	const client = new NewApiClient(
-		(async () => new Response(JSON.stringify({ success: false, message: "账号或密码错误" }), { status: 401 })) as typeof fetch,
+		(async () => new Response(JSON.stringify({ success: false, message: "Unauthorized, invalid access token" }), { status: 401 })) as typeof fetch,
 	);
 	await assert.rejects(
-		() => client.login({ baseUrl: "https://example.test", username: "u", password: "secret" }),
+		() => client.refresh({ baseUrl: "https://example.test", userId: "56", accessToken: "bad" }),
 		AuthenticationError,
 	);
+});
+
+test("restores periodic refresh only for the retained current account", () => {
+	const config: NewApiConfig = {
+		baseUrl: "https://example.test",
+		userId: "56",
+		accessToken: "synthetic-token",
+	};
+	assert.equal(shouldRestorePeriodicRefresh(config, true, true), true);
+	assert.equal(shouldRestorePeriodicRefresh(undefined, true, true), false);
+	assert.equal(shouldRestorePeriodicRefresh(config, false, true), false);
+	assert.equal(shouldRestorePeriodicRefresh(config, true, false), false);
 });

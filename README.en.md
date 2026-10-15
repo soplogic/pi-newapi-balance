@@ -39,12 +39,11 @@
 ## Features
 
 - ⚙️ **Any site** — configure the Base URL of any New API site (trailing `/v1` stripped automatically)
-- 👀 **Footer display** — the balance lives in the Pi footer, no extra panels
+- 👀 **Footer display** — the balance and 24h usage live in the Pi footer, no extra panels
 - 🔄 **Smart refresh** — on startup + every 5 minutes; instant refresh after each agent turn fully settles, with settlement re-checks at 1/3/6s for async settlement
 - 🎬 **Deduction animation** — remaining re-checks cancelled on balance drop; rolls to the new value in ~800ms, red delta shown for 3s
 - 🧹 **Safe cleanup** — background tasks cleaned up on session switch, `/reload`, new conversation, manual refresh and exit
-- 🔑 **Auto re-login** — expired sessions re-authenticate automatically
-- 📦 **Config migration** — imports settings from the legacy cat-laoban balance extension
+- 🔑 **Token auth** — stateless authentication via user ID + system access token, no username or password
 
 ## Install
 
@@ -74,13 +73,13 @@ First run:
 /newapi-login
 ```
 
-Follow the three on-screen prompts: site URL, username, password (masked).
+Follow the three on-screen prompts: site URL, user ID, and system access token (masked).
 
 | Command | Purpose |
 | --- | --- |
 | `/newapi-login` | Log in or switch New API site |
 | `/newapi-refresh` | Refresh balance immediately |
-| `/newapi-status` | Show site, balance, last update time and error state |
+| `/newapi-status` | Show site, balance, 24h usage, last update time and error state |
 | `/newapi-logout` | Log out and clear local credentials |
 
 ## How refresh works

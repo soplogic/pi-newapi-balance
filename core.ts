@@ -1,25 +1,29 @@
 import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
-export const LEGACY_DEFAULT_BASE_URL = "https://api.maolaoapi.cc";
 export const DEFAULT_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 export const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 export const QUOTA_PER_YUAN = 500_000;
 export const MAX_API_MESSAGE_LENGTH = 240;
+export const RECENT_USAGE_DAYS = 1;
 
 const CONTROL_CHARACTERS = /[\p{Cc}\p{Cf}]/gu;
 
 export interface NewApiConfig {
 	baseUrl: string;
-	username: string;
-	password: string;
-	session?: string;
-	userId?: number;
+	userId: string;
+	accessToken: string;
 }
 
 export interface BalanceResult {
 	quota: number;
 	balance: number;
+}
+
+export interface RecentUsageResult {
+	quota: number;
+	requestCount: number;
+	tokenCount: number;
 }
 
 interface ApiEnvelope<T> {
@@ -28,16 +32,20 @@ interface ApiEnvelope<T> {
 	data?: T;
 }
 
-interface LoginData {
-	id: number;
-}
-
 interface SelfData {
 	quota: number;
 }
 
+interface UsageStatData {
+	quota?: number;
+	request_count?: number;
+	rpm?: number;
+	token_count?: number;
+	tpm?: number;
+}
+
 export class AuthenticationError extends Error {
-	constructor(message = "登录已失效") {
+	constructor(message = "访问令牌无效") {
 		super(message);
 		this.name = "AuthenticationError";
 	}
@@ -70,39 +78,22 @@ export function normalizeBaseUrl(value: string): string {
 	return url.toString().replace(/\/$/, "");
 }
 
-type ConfigSource = "current" | "legacy";
-
-async function loadConfigFile(path: string, source: ConfigSource): Promise<NewApiConfig | undefined> {
+/** Load the current config format, which requires a userId and access token. */
+export async function loadConfig(path: string): Promise<NewApiConfig | undefined> {
 	try {
 		const value = JSON.parse(await readFile(path, "utf8")) as Partial<NewApiConfig>;
-		if (typeof value.username !== "string" || typeof value.password !== "string") return undefined;
-		const baseUrl = typeof value.baseUrl === "string"
-			? value.baseUrl
-			: source === "legacy"
-				? LEGACY_DEFAULT_BASE_URL
-				: undefined;
-		if (baseUrl === undefined) return undefined;
+		if (typeof value.userId !== "string" || !value.userId.trim()) return undefined;
+		if (typeof value.accessToken !== "string" || !value.accessToken.trim()) return undefined;
+		if (typeof value.baseUrl !== "string") return undefined;
 		return {
-			baseUrl: normalizeBaseUrl(baseUrl),
-			username: value.username,
-			password: value.password,
-			session: typeof value.session === "string" ? value.session : undefined,
-			userId: typeof value.userId === "number" ? value.userId : undefined,
+			baseUrl: normalizeBaseUrl(value.baseUrl),
+			userId: value.userId.trim(),
+			accessToken: value.accessToken,
 		};
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
 		throw error;
 	}
-}
-
-/** Load the current config format, which always requires an explicit Base URL. */
-export function loadConfig(path: string): Promise<NewApiConfig | undefined> {
-	return loadConfigFile(path, "current");
-}
-
-/** Load the legacy config format for migration, supplying its historical site URL when absent. */
-export function loadLegacyConfig(path: string): Promise<NewApiConfig | undefined> {
-	return loadConfigFile(path, "legacy");
 }
 
 function canonicalizeSensitiveValue(value: string): string {
@@ -156,11 +147,6 @@ export function sanitizeApiMessage(
 		: sanitized;
 }
 
-/** NewApiClient.refresh preserves config identity unless it reauthenticates. */
-export function shouldPersistRefreshedConfig(current: NewApiConfig, refreshed: NewApiConfig): boolean {
-	return current !== refreshed;
-}
-
 export function shouldRestorePeriodicRefresh(
 	currentConfig: NewApiConfig | undefined,
 	sessionActive: boolean,
@@ -192,29 +178,19 @@ export async function removeConfig(path: string): Promise<void> {
 }
 
 function apiMessage(value: ApiEnvelope<unknown>, fallback: string, config: NewApiConfig): string {
-	return sanitizeApiMessage(value.message, fallback, [config.username, config.password, config.session]);
+	return sanitizeApiMessage(value.message, fallback, [config.userId, config.accessToken]);
 }
 
 function isAuthenticationFailure(response: Response, payload: ApiEnvelope<unknown>): boolean {
 	if (response.status === 401 || response.status === 403) return true;
 	if (payload.success !== false) return false;
-	return /未登录|登录失效|请登录|认证|授权|session/i.test(payload.message ?? "");
+	return /未登录|登录失效|请登录|认证|授权|session|token/i.test(payload.message ?? "");
 }
 
 async function withTimeout<T>(signal: AbortSignal | undefined, operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
 	const timeoutSignal = AbortSignal.timeout(DEFAULT_REQUEST_TIMEOUT_MS);
 	const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
 	return operation(combinedSignal);
-}
-
-function readSessionCookie(response: Response): string | undefined {
-	const headers = response.headers as Headers & { getSetCookie?: () => string[] };
-	const values = headers.getSetCookie?.() ?? [response.headers.get("set-cookie") ?? ""];
-	for (const value of values) {
-		const match = value.match(/(?:^|[,;]\s*)session=([^;]+)/i);
-		if (match) return match[1];
-	}
-	return undefined;
 }
 
 export class NewApiClient {
@@ -224,44 +200,16 @@ export class NewApiClient {
 		this.fetchImpl = fetchImpl;
 	}
 
-	async login(config: NewApiConfig, signal?: AbortSignal): Promise<NewApiConfig> {
-		const baseUrl = normalizeBaseUrl(config.baseUrl);
-		const origin = new URL(baseUrl).origin;
-		const response = await withTimeout(signal, (requestSignal) =>
-			this.fetchImpl(`${baseUrl}/api/user/login?turnstile=`, {
-				method: "POST",
-				headers: {
-					accept: "application/json, text/plain, */*",
-					"cache-control": "no-store",
-					"content-type": "application/json",
-					"new-api-user": "-1",
-					origin,
-					referer: `${baseUrl}/login`,
-				},
-				body: JSON.stringify({ username: config.username, password: config.password }),
-				redirect: "error",
-				signal: requestSignal,
-			}),
-		);
-		const payload = (await response.json().catch(() => ({}))) as ApiEnvelope<LoginData>;
-		if (!response.ok || !payload.success || typeof payload.data?.id !== "number") {
-			throw new AuthenticationError(apiMessage(payload, `登录失败 (HTTP ${response.status})`, config));
-		}
-		const session = readSessionCookie(response);
-		if (!session) throw new AuthenticationError("登录成功，但响应中没有会话 Cookie");
-		return { ...config, baseUrl, session, userId: payload.data.id };
-	}
-
 	async getBalance(config: NewApiConfig, signal?: AbortSignal): Promise<BalanceResult> {
-		if (!config.session || typeof config.userId !== "number") throw new AuthenticationError();
+		if (!config.userId || !config.accessToken) throw new AuthenticationError();
 		const baseUrl = normalizeBaseUrl(config.baseUrl);
 		const response = await withTimeout(signal, (requestSignal) =>
 			this.fetchImpl(`${baseUrl}/api/user/self`, {
 				headers: {
 					accept: "application/json, text/plain, */*",
 					"cache-control": "no-store",
-					cookie: `session=${config.session}`,
-					"new-api-user": String(config.userId),
+					authorization: `Bearer ${config.accessToken}`,
+					"new-api-user": config.userId,
 					referer: `${baseUrl}/console`,
 				},
 				redirect: "error",
@@ -270,7 +218,7 @@ export class NewApiClient {
 		);
 		const payload = (await response.json().catch(() => ({}))) as ApiEnvelope<SelfData>;
 		if (isAuthenticationFailure(response, payload)) {
-			throw new AuthenticationError(apiMessage(payload, "登录已失效", config));
+			throw new AuthenticationError(apiMessage(payload, "访问令牌无效", config));
 		}
 		if (!response.ok || !payload.success) {
 			throw new Error(apiMessage(payload, `余额请求失败 (HTTP ${response.status})`, config));
@@ -281,14 +229,53 @@ export class NewApiClient {
 		return { quota: payload.data.quota, balance: quotaToBalance(payload.data.quota) };
 	}
 
-	async refresh(config: NewApiConfig, signal?: AbortSignal): Promise<{ config: NewApiConfig; result: BalanceResult }> {
-		let activeConfig = config;
-		try {
-			return { config: activeConfig, result: await this.getBalance(activeConfig, signal) };
-		} catch (error) {
-			if (!(error instanceof AuthenticationError)) throw error;
+	async getRecentUsage(config: NewApiConfig, signal?: AbortSignal): Promise<RecentUsageResult> {
+		if (!config.userId || !config.accessToken) throw new AuthenticationError();
+		const baseUrl = normalizeBaseUrl(config.baseUrl);
+		const endTimestamp = Math.floor(Date.now() / 1000);
+		const startTimestamp = endTimestamp - RECENT_USAGE_DAYS * 24 * 60 * 60;
+		const url = new URL(`${baseUrl}/api/log/self/stat`);
+		url.searchParams.set("start_timestamp", String(startTimestamp));
+		url.searchParams.set("end_timestamp", String(endTimestamp));
+		url.searchParams.set("default_time", String(RECENT_USAGE_DAYS));
+		const response = await withTimeout(signal, (requestSignal) =>
+			this.fetchImpl(url.toString(), {
+				headers: {
+					accept: "application/json, text/plain, */*",
+					"cache-control": "no-store",
+					authorization: `Bearer ${config.accessToken}`,
+					"new-api-user": config.userId,
+					referer: `${baseUrl}/console`,
+				},
+				redirect: "error",
+				signal: requestSignal,
+			}),
+		);
+		const payload = (await response.json().catch(() => ({}))) as ApiEnvelope<UsageStatData>;
+		if (isAuthenticationFailure(response, payload)) {
+			throw new AuthenticationError(apiMessage(payload, "访问令牌无效", config));
 		}
-		activeConfig = await this.login(config, signal);
-		return { config: activeConfig, result: await this.getBalance(activeConfig, signal) };
+		if (!response.ok || !payload.success) {
+			throw new Error(apiMessage(payload, `用量请求失败 (HTTP ${response.status})`, config));
+		}
+		const data = payload.data ?? {};
+		const quota = typeof data.quota === "number" && Number.isFinite(data.quota) ? data.quota : 0;
+		const requestCount = typeof data.request_count === "number" ? data.request_count : typeof data.rpm === "number" ? data.rpm : 0;
+		const tokenCount = typeof data.token_count === "number" ? data.token_count : typeof data.tpm === "number" ? data.tpm : 0;
+		return { quota, requestCount, tokenCount };
+	}
+
+	async refresh(
+		config: NewApiConfig,
+		signal?: AbortSignal,
+	): Promise<{ config: NewApiConfig; result: BalanceResult; usage?: RecentUsageResult }> {
+		const result = await this.getBalance(config, signal);
+		let usage: RecentUsageResult | undefined;
+		try {
+			usage = await this.getRecentUsage(config, signal);
+		} catch {
+			usage = undefined;
+		}
+		return { config, result, usage };
 	}
 }
